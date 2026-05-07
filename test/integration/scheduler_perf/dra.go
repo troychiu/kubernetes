@@ -191,10 +191,12 @@ func (op *createResourceDriverOp) run(tCtx ktesting.TContext, draManager framewo
 
 	numSlices := 0
 	for _, nodeName := range driverNodes {
-		slice := resourceSlice(op.DriverName, nodeName, op.MaxClaimsPerNode)
-		_, err := tCtx.Client().ResourceV1().ResourceSlices().Create(tCtx, slice, metav1.CreateOptions{})
-		tCtx.ExpectNoError(err, "create node resource slice")
-		numSlices++
+		slices := resourceSlice(op.DriverName, nodeName, op.MaxClaimsPerNode)
+		for _, slice := range slices {
+			_, err := tCtx.Client().ResourceV1().ResourceSlices().Create(tCtx, slice, metav1.CreateOptions{})
+			tCtx.ExpectNoError(err, "create node resource slice")
+			numSlices++
+		}
 	}
 
 	tCtx.Eventually(func(tCtx ktesting.TContext) int {
@@ -212,24 +214,52 @@ func (op *createResourceDriverOp) run(tCtx ktesting.TContext, draManager framewo
 	})
 }
 
-func resourceSlice(driverName, nodeName string, capacity int) *resourceapi.ResourceSlice {
-	slice := &resourceapi.ResourceSlice{
+func resourceSlice(driverName, nodeName string, capacity int) []*resourceapi.ResourceSlice {
+	// Slice 1: Counter Sets
+	slice1 := &resourceapi.ResourceSlice{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: nodeName,
+			Name: fmt.Sprintf("%s-counters", nodeName),
 		},
-
 		Spec: resourceapi.ResourceSliceSpec{
 			Driver:   driverName,
 			NodeName: &nodeName,
 			Pool: resourceapi.ResourcePool{
 				Name:               nodeName,
-				ResourceSliceCount: 1,
+				ResourceSliceCount: 2,
+			},
+		},
+	}
+
+	counters := make(map[string]resourceapi.Counter)
+	for i := range capacity {
+		counters[fmt.Sprintf("counter-%d", i)] = resourceapi.Counter{
+			Value: resource.MustParse("1"),
+		}
+	}
+	slice1.Spec.SharedCounters = []resourceapi.CounterSet{
+		{
+			Name:     "counter-set",
+			Counters: counters,
+		},
+	}
+
+	// Slice 2: Devices
+	slice2 := &resourceapi.ResourceSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("%s-devices", nodeName),
+		},
+		Spec: resourceapi.ResourceSliceSpec{
+			Driver:   driverName,
+			NodeName: &nodeName,
+			Pool: resourceapi.ResourcePool{
+				Name:               nodeName,
+				ResourceSliceCount: 2,
 			},
 		},
 	}
 
 	for i := range capacity {
-		slice.Spec.Devices = append(slice.Spec.Devices,
+		slice2.Spec.Devices = append(slice2.Spec.Devices,
 			resourceapi.Device{
 				Name: fmt.Sprintf("instance-%d", i),
 				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
@@ -241,12 +271,23 @@ func resourceSlice(driverName, nodeName string, capacity int) *resourceapi.Resou
 				Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
 					"memory": {Value: resource.MustParse("1Gi")},
 				},
+				ConsumesCounters: []resourceapi.DeviceCounterConsumption{
+					{
+						CounterSet: "counter-set",
+						Counters: map[string]resourceapi.Counter{
+							fmt.Sprintf("counter-%d", i): {
+								Value: resource.MustParse("1"),
+							},
+						},
+					},
+				},
 			},
 		)
 	}
 
-	return slice
+	return []*resourceapi.ResourceSlice{slice1, slice2}
 }
+
 
 // allocResourceClaimsOp defines an op where resource claims with structured
 // parameters get allocated without being associated with a pod.

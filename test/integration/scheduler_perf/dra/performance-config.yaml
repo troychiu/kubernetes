@@ -134,6 +134,7 @@
 - name: SteadyStateClusterResourceClaimTemplate
   featureGates:
     DynamicResourceAllocation: true
+    DRAPartitionableDevices: true
   workloadTemplate:
   - opcode: createNodes
     countParam: $nodesWithoutDRA
