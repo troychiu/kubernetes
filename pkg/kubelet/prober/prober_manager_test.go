@@ -102,10 +102,12 @@ func TestAddRemovePods(t *testing.T) {
 
 	// Adding a pod with probes.
 	m.AddPod(ctx, &probePod)
-	probePaths := []probeKey{
-		{"probe_pod", "readiness", readiness},
-		{"probe_pod", "liveness", liveness},
-		{"probe_pod", "startup", startup},
+	probePaths := map[types.UID][]containerProbeKey{
+		"probe_pod": {
+			{"readiness", readiness},
+			{"liveness", liveness},
+			{"startup", startup},
+		},
 	}
 	if err := expectProbes(m, probePaths); err != nil {
 		t.Error(err)
@@ -159,16 +161,20 @@ func TestAddPodContinuesAfterExistingWorker(t *testing.T) {
 
 	// First AddPod: registers workers for both containers.
 	m.AddPod(ctx, &pod)
-	if err := expectProbes(m, []probeKey{
-		{"test_pod", "container_a", readiness},
-		{"test_pod", "container_b", readiness},
+	if err := expectProbes(m, map[types.UID][]containerProbeKey{
+		"test_pod": {
+			{"container_a", readiness},
+			{"container_b", readiness},
+		},
 	}); err != nil {
 		t.Fatalf("after first AddPod: %v", err)
 	}
 
 	// Simulate container_b's worker being removed while container_a's is still present.
 	m.workerLock.Lock()
-	delete(m.workers, probeKey{"test_pod", "container_b", readiness})
+	if podWorkers, ok := m.workers["test_pod"]; ok {
+		delete(podWorkers, containerProbeKey{"container_b", readiness})
+	}
 	m.workerLock.Unlock()
 
 	// Second AddPod: should re-register container_b's missing worker.
@@ -176,9 +182,11 @@ func TestAddPodContinuesAfterExistingWorker(t *testing.T) {
 	// so container_b was never re-registered.
 	m.AddPod(ctx, &pod)
 
-	if err := expectProbes(m, []probeKey{
-		{"test_pod", "container_a", readiness},
-		{"test_pod", "container_b", readiness},
+	if err := expectProbes(m, map[types.UID][]containerProbeKey{
+		"test_pod": {
+			{"container_a", readiness},
+			{"container_b", readiness},
+		},
 	}); err != nil {
 		t.Errorf("container_b worker was not re-registered after second AddPod: %v", err)
 	}
@@ -193,7 +201,7 @@ func TestAddRemovePodsWithRestartableInitContainer(t *testing.T) {
 
 	testCases := []struct {
 		desc                        string
-		probePaths                  []probeKey
+		probePaths                  map[types.UID][]containerProbeKey
 		hasRestartableInitContainer bool
 	}{
 		{
@@ -203,10 +211,12 @@ func TestAddRemovePodsWithRestartableInitContainer(t *testing.T) {
 		},
 		{
 			desc: "pod with sidecar",
-			probePaths: []probeKey{
-				{"restartable_init_container_pod", "restartable-init", liveness},
-				{"restartable_init_container_pod", "restartable-init", readiness},
-				{"restartable_init_container_pod", "restartable-init", startup},
+			probePaths: map[types.UID][]containerProbeKey{
+				"restartable_init_container_pod": {
+					{"restartable-init", liveness},
+					{"restartable-init", readiness},
+					{"restartable-init", startup},
+				},
 			},
 			hasRestartableInitContainer: true,
 		},
@@ -312,15 +322,19 @@ func TestCleanupPods(t *testing.T) {
 	desiredPods[podToKeep.UID] = sets.Empty{}
 	m.CleanupPods(desiredPods)
 
-	removedProbes := []probeKey{
-		{"pod_cleanup", "prober1", readiness},
-		{"pod_cleanup", "prober2", liveness},
-		{"pod_cleanup", "prober3", startup},
+	removedProbes := map[types.UID][]containerProbeKey{
+		"pod_cleanup": {
+			{"prober1", readiness},
+			{"prober2", liveness},
+			{"prober3", startup},
+		},
 	}
-	expectedProbes := []probeKey{
-		{"pod_keep", "prober1", readiness},
-		{"pod_keep", "prober2", liveness},
-		{"pod_keep", "prober3", startup},
+	expectedProbes := map[types.UID][]containerProbeKey{
+		"pod_keep": {
+			{"prober1", readiness},
+			{"prober2", liveness},
+			{"prober3", startup},
+		},
 	}
 	if err := waitForWorkerExit(t, m, removedProbes); err != nil {
 		t.Fatal(err)
@@ -420,14 +434,16 @@ func TestUpdatePodStatus(t *testing.T) {
 	// no cleanup: using fake workers.
 
 	// Setup probe "workers" and cached results.
-	m.workers = map[probeKey]*worker{
-		{testPodUID, unprobed.Name, liveness}:             {},
-		{testPodUID, probedReady.Name, readiness}:         {},
-		{testPodUID, probedPending.Name, readiness}:       {},
-		{testPodUID, probedUnready.Name, readiness}:       {},
-		{testPodUID, notStartedNoReadiness.Name, startup}: {},
-		{testPodUID, startedNoReadiness.Name, startup}:    {},
-		{testPodUID, terminated.Name, readiness}:          {},
+	m.workers = map[types.UID]map[containerProbeKey]*worker{
+		testPodUID: {
+			{unprobed.Name, liveness}:             {},
+			{probedReady.Name, readiness}:         {},
+			{probedPending.Name, readiness}:       {},
+			{probedUnready.Name, readiness}:       {},
+			{notStartedNoReadiness.Name, startup}: {},
+			{startedNoReadiness.Name, startup}:    {},
+			{terminated.Name, readiness}:          {},
+		},
 	}
 	m.readinessManager.Set(kubecontainer.ParseContainerID(logger, probedReady.ContainerID), results.Success, &v1.Pod{})
 	m.readinessManager.Set(kubecontainer.ParseContainerID(logger, probedUnready.ContainerID), results.Failure, &v1.Pod{})
@@ -451,17 +467,17 @@ func TestUpdatePodStatus(t *testing.T) {
 		},
 	}, &podStatus)
 
-	expectedReadiness := map[probeKey]bool{
-		{testPodUID, unprobed.Name, readiness}:              true,
-		{testPodUID, probedReady.Name, readiness}:           true,
-		{testPodUID, probedPending.Name, readiness}:         false,
-		{testPodUID, probedUnready.Name, readiness}:         false,
-		{testPodUID, notStartedNoReadiness.Name, readiness}: false,
-		{testPodUID, startedNoReadiness.Name, readiness}:    true,
-		{testPodUID, terminated.Name, readiness}:            false,
+	expectedReadiness := map[containerProbeKey]bool{
+		{unprobed.Name, readiness}:              true,
+		{probedReady.Name, readiness}:           true,
+		{probedPending.Name, readiness}:         false,
+		{probedUnready.Name, readiness}:         false,
+		{notStartedNoReadiness.Name, readiness}: false,
+		{startedNoReadiness.Name, readiness}:    true,
+		{terminated.Name, readiness}:            false,
 	}
 	for _, c := range podStatus.ContainerStatuses {
-		expected, ok := expectedReadiness[probeKey{testPodUID, c.Name, readiness}]
+		expected, ok := expectedReadiness[containerProbeKey{c.Name, readiness}]
 		if !ok {
 			t.Fatalf("Missing expectation for test case: %v", c.Name)
 		}
@@ -500,43 +516,45 @@ func TestUpdatePodStatusWithInitContainers(t *testing.T) {
 	// no cleanup: using fake workers.
 
 	// Setup probe "workers" and cached results.
-	m.workers = map[probeKey]*worker{
-		{testPodUID, notStarted.Name, startup}: {},
-		{testPodUID, started.Name, startup}:    {},
+	m.workers = map[types.UID]map[containerProbeKey]*worker{
+		testPodUID: {
+			{notStarted.Name, startup}: {},
+			{started.Name, startup}:    {},
+		},
 	}
 	m.startupManager.Set(kubecontainer.ParseContainerID(logger, started.ContainerID), results.Success, &v1.Pod{})
 
 	testCases := []struct {
 		desc                        string
-		expectedStartup             map[probeKey]bool
-		expectedReadiness           map[probeKey]bool
+		expectedStartup             map[containerProbeKey]bool
+		expectedReadiness           map[containerProbeKey]bool
 		hasRestartableInitContainer bool
 	}{
 		{
 			desc: "init containers",
-			expectedStartup: map[probeKey]bool{
-				{testPodUID, notStarted.Name, startup}: false,
-				{testPodUID, started.Name, startup}:    true,
-				{testPodUID, terminated.Name, startup}: false,
+			expectedStartup: map[containerProbeKey]bool{
+				{notStarted.Name, startup}: false,
+				{started.Name, startup}:    true,
+				{terminated.Name, startup}: false,
 			},
-			expectedReadiness: map[probeKey]bool{
-				{testPodUID, notStarted.Name, readiness}: false,
-				{testPodUID, started.Name, readiness}:    false,
-				{testPodUID, terminated.Name, readiness}: true,
+			expectedReadiness: map[containerProbeKey]bool{
+				{notStarted.Name, readiness}: false,
+				{started.Name, readiness}:    false,
+				{terminated.Name, readiness}: true,
 			},
 			hasRestartableInitContainer: false,
 		},
 		{
 			desc: "init container with Always restartPolicy",
-			expectedStartup: map[probeKey]bool{
-				{testPodUID, notStarted.Name, startup}: false,
-				{testPodUID, started.Name, startup}:    true,
-				{testPodUID, terminated.Name, startup}: false,
+			expectedStartup: map[containerProbeKey]bool{
+				{notStarted.Name, startup}: false,
+				{started.Name, startup}:    true,
+				{terminated.Name, startup}: false,
 			},
-			expectedReadiness: map[probeKey]bool{
-				{testPodUID, notStarted.Name, readiness}: false,
-				{testPodUID, started.Name, readiness}:    true,
-				{testPodUID, terminated.Name, readiness}: false,
+			expectedReadiness: map[containerProbeKey]bool{
+				{notStarted.Name, readiness}: false,
+				{started.Name, readiness}:    true,
+				{terminated.Name, readiness}: false,
 			},
 			hasRestartableInitContainer: true,
 		},
@@ -584,7 +602,7 @@ func TestUpdatePodStatusWithInitContainers(t *testing.T) {
 
 			for _, c := range podStatus.InitContainerStatuses {
 				{
-					expected, ok := tc.expectedStartup[probeKey{testPodUID, c.Name, startup}]
+					expected, ok := tc.expectedStartup[containerProbeKey{c.Name, startup}]
 					if !ok {
 						t.Fatalf("Missing expectation for test case: %v", c.Name)
 					}
@@ -594,7 +612,7 @@ func TestUpdatePodStatusWithInitContainers(t *testing.T) {
 					}
 				}
 				{
-					expected, ok := tc.expectedReadiness[probeKey{testPodUID, c.Name, readiness}]
+					expected, ok := tc.expectedReadiness[containerProbeKey{c.Name, readiness}]
 					if !ok {
 						t.Fatalf("Missing expectation for test case: %v", c.Name)
 					}
@@ -638,7 +656,9 @@ func TestUpdateReadiness(t *testing.T) {
 	m.statusManager.SetPodStatus(logger, testPod, getTestRunningStatus())
 
 	m.AddPod(ctx, testPod)
-	probePaths := []probeKey{{testPodUID, testContainerName, readiness}}
+	probePaths := map[types.UID][]containerProbeKey{
+		testPodUID: {{testContainerName, readiness}},
+	}
 	if err := expectProbes(m, probePaths); err != nil {
 		t.Error(err)
 	}
@@ -657,47 +677,75 @@ func TestUpdateReadiness(t *testing.T) {
 	}
 }
 
-func expectProbes(m *manager, expectedProbes []probeKey) error {
+func expectProbes(m *manager, expected map[types.UID][]containerProbeKey) error {
 	m.workerLock.RLock()
 	defer m.workerLock.RUnlock()
 
-	var unexpected []probeKey
-	missing := make([]probeKey, len(expectedProbes))
-	copy(missing, expectedProbes)
+	// Build a map of what we actually have
+	actual := make(map[types.UID]sets.Set[containerProbeKey])
+	for podUID, podWorkers := range m.workers {
+		actual[podUID] = sets.New[containerProbeKey]()
+		for cKey := range podWorkers {
+			actual[podUID].Insert(cKey)
+		}
+	}
 
-outer:
-	for probePath := range m.workers {
-		for i, expectedPath := range missing {
-			if probePath == expectedPath {
-				missing = append(missing[:i], missing[i+1:]...)
-				continue outer
+	// Compare
+	var unexpected []string
+	var missing []string
+
+	// Check expected against actual
+	for podUID, expectedKeys := range expected {
+		actualKeys, ok := actual[podUID]
+		if !ok {
+			for _, ek := range expectedKeys {
+				missing = append(missing, fmt.Sprintf("%s/%s/%s", podUID, ek.containerName, ek.probeType.String()))
+			}
+			continue
+		}
+		for _, ek := range expectedKeys {
+			if !actualKeys.Has(ek) {
+				missing = append(missing, fmt.Sprintf("%s/%s/%s", podUID, ek.containerName, ek.probeType.String()))
+			} else {
+				actualKeys.Delete(ek) // Remove so we can detect unexpected ones
 			}
 		}
-		unexpected = append(unexpected, probePath)
+		if actualKeys.Len() == 0 {
+			delete(actual, podUID)
+		}
+	}
+
+	// Anything left in actual is unexpected
+	for podUID, actualKeys := range actual {
+		for ak := range actualKeys {
+			unexpected = append(unexpected, fmt.Sprintf("%s/%s/%s", podUID, ak.containerName, ak.probeType.String()))
+		}
 	}
 
 	if len(missing) == 0 && len(unexpected) == 0 {
-		return nil // Yay!
+		return nil
 	}
 
-	return fmt.Errorf("Unexpected probes: %v; Missing probes: %v;", unexpected, missing)
+	return fmt.Errorf("Unexpected probes: %v; Missing probes: %v", unexpected, missing)
 }
 
 const interval = 1 * time.Second
 
 // Wait for the given workers to exit & clean up.
-func waitForWorkerExit(t *testing.T, m *manager, workerPaths []probeKey) error {
-	for _, w := range workerPaths {
-		condition := func() (bool, error) {
-			_, exists := m.getWorker(w.podUID, w.containerName, w.probeType)
-			return !exists, nil
-		}
-		if exited, _ := condition(); exited {
-			continue // Already exited, no need to poll.
-		}
-		t.Logf("Polling %v", w)
-		if err := wait.Poll(interval, wait.ForeverTestTimeout, condition); err != nil {
-			return err
+func waitForWorkerExit(t *testing.T, m *manager, expected map[types.UID][]containerProbeKey) error {
+	for podUID, containerProbes := range expected {
+		for _, cp := range containerProbes {
+			condition := func() (bool, error) {
+				_, exists := m.getWorker(podUID, cp.containerName, cp.probeType)
+				return !exists, nil
+			}
+			if exited, _ := condition(); exited {
+				continue // Already exited, no need to poll.
+			}
+			t.Logf("Polling worker for pod %s, container %s, probe %s", podUID, cp.containerName, cp.probeType.String())
+			if err := wait.Poll(interval, wait.ForeverTestTimeout, condition); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -744,5 +792,70 @@ func cleanup(t *testing.T, m *manager) {
 	}
 	if err := wait.Poll(interval, wait.ForeverTestTimeout, condition); err != nil {
 		t.Fatalf("Error during cleanup: %v", err)
+	}
+}
+
+func TestAddPodDynamicContainers(t *testing.T) {
+	ctx := ktesting.Init(t)
+	m := newTestManager()
+	defer cleanup(t, m)
+
+	pod := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: "dynamic_pod",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:           "container1",
+					ReadinessProbe: defaultProbe,
+				},
+			},
+		},
+	}
+
+	// 1. Initial AddPod with container1
+	m.AddPod(ctx, &pod)
+	if err := expectProbes(m, map[types.UID][]containerProbeKey{
+		"dynamic_pod": {{"container1", readiness}},
+	}); err != nil {
+		t.Fatalf("Initial AddPod failed: %v", err)
+	}
+
+	// 2. AddPod again with an additional container (container2)
+	pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{
+		Name:           "container2",
+		ReadinessProbe: defaultProbe,
+	})
+	m.AddPod(ctx, &pod)
+	if err := expectProbes(m, map[types.UID][]containerProbeKey{
+		"dynamic_pod": {
+			{"container1", readiness},
+			{"container2", readiness},
+		},
+	}); err != nil {
+		t.Fatalf("AddPod with additional container failed: %v", err)
+	}
+
+	// 3. AddPod again with container1 deleted
+	pod.Spec.Containers = []v1.Container{
+		{
+			Name:           "container2",
+			ReadinessProbe: defaultProbe,
+		},
+	}
+	m.AddPod(ctx, &pod)
+
+	// We need to wait for container1's worker to exit because stop is async
+	if err := waitForWorkerExit(t, m, map[types.UID][]containerProbeKey{
+		"dynamic_pod": {{"container1", readiness}},
+	}); err != nil {
+		t.Fatalf("Waiting for container1 worker to exit failed: %v", err)
+	}
+
+	if err := expectProbes(m, map[types.UID][]containerProbeKey{
+		"dynamic_pod": {{"container2", readiness}},
+	}); err != nil {
+		t.Fatalf("AddPod with deleted container failed: %v", err)
 	}
 }

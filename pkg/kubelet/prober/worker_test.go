@@ -23,6 +23,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes/fake"
@@ -607,11 +608,14 @@ func TestCleanUp(t *testing.T) {
 	m := newTestManager()
 
 	for _, probeType := range [...]probeType{liveness, readiness, startup} {
-		key := probeKey{testPodUID, testContainerName, probeType}
+		ckey := containerProbeKey{testContainerName, probeType}
 		w := newTestWorker(m, probeType, v1.Probe{})
 		m.statusManager.SetPodStatus(logger, w.pod, getTestRunningStatusWithStarted(probeType != startup))
 		go w.run(ctx)
-		m.workers[key] = w
+		if m.workers[testPodUID] == nil {
+			m.workers[testPodUID] = make(map[containerProbeKey]*worker)
+		}
+		m.workers[testPodUID][containerProbeKey{testContainerName, probeType}] = w
 
 		// Wait for worker to run.
 		condition := func() (bool, error) {
@@ -627,15 +631,17 @@ func TestCleanUp(t *testing.T) {
 		for i := 0; i < 10; i++ {
 			w.stop() // Stop should be callable multiple times without consequence.
 		}
-		if err := waitForWorkerExit(t, m, []probeKey{key}); err != nil {
+		if err := waitForWorkerExit(t, m, map[types.UID][]containerProbeKey{testPodUID: {ckey}}); err != nil {
 			t.Fatalf("[%s] error waiting for worker exit: %v", probeType, err)
 		}
 
 		if _, ok := resultsManager(m, probeType).Get(testContainerID); ok {
 			t.Errorf("[%s] Expected result to be cleared.", probeType)
 		}
-		if _, ok := m.workers[key]; ok {
-			t.Errorf("[%s] Expected worker to be cleared.", probeType)
+		if podWorkers, ok := m.workers[testPodUID]; ok {
+			if _, ok := podWorkers[containerProbeKey{testContainerName, probeType}]; ok {
+				t.Errorf("[%s] Expected worker to be cleared.", probeType)
+			}
 		}
 	}
 }

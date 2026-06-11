@@ -94,8 +94,8 @@ type Manager interface {
 }
 
 type manager struct {
-	// Map of active workers for probes
-	workers map[probeKey]*worker
+	// Map of active workers for probes, grouped by pod UID
+	workers map[types.UID]map[containerProbeKey]*worker
 	// Lock for accessing & mutating workers
 	workerLock sync.RWMutex
 
@@ -133,14 +133,13 @@ func NewManager(
 		readinessManager: readinessManager,
 		livenessManager:  livenessManager,
 		startupManager:   startupManager,
-		workers:          make(map[probeKey]*worker),
+		workers:          make(map[types.UID]map[containerProbeKey]*worker),
 		start:            clock.RealClock{}.Now(),
 	}
 }
 
-// Key uniquely identifying container probes
-type probeKey struct {
-	podUID        types.UID
+// containerProbeKey uniquely identifies a probe within a pod (scoped to container and type)
+type containerProbeKey struct {
 	containerName string
 	probeType     probeType
 }
@@ -186,46 +185,44 @@ func (m *manager) AddPod(ctx context.Context, pod *v1.Pod) {
 	m.workerLock.Lock()
 	defer m.workerLock.Unlock()
 
-	logger := klog.FromContext(ctx)
-	key := probeKey{podUID: pod.UID}
-	for _, c := range append(pod.Spec.Containers, getRestartableInitContainers(pod)...) {
-		key.containerName = c.Name
+	podWorkers, ok := m.workers[pod.UID]
+	if !ok {
+		podWorkers = make(map[containerProbeKey]*worker)
+		m.workers[pod.UID] = podWorkers
+	}
 
-		if c.StartupProbe != nil {
-			key.probeType = startup
-			if _, ok := m.workers[key]; ok {
-				logger.V(8).Info("Startup probe already exists for container",
-					"pod", klog.KObj(pod), "containerName", c.Name)
-				continue
-			}
-			w := newWorker(m, startup, pod, c)
-			m.workers[key] = w
+	visited := sets.New[containerProbeKey]()
+
+	reconcileProbe := func(c v1.Container, probeType probeType, probeSpec *v1.Probe) {
+		if probeSpec == nil {
+			return
+		}
+		key := containerProbeKey{c.Name, probeType}
+		visited.Insert(key)
+
+		if _, exists := podWorkers[key]; !exists {
+			w := newWorker(m, probeType, pod, c)
+			podWorkers[key] = w
 			go w.run(ctx)
 		}
+	}
 
-		if c.ReadinessProbe != nil {
-			key.probeType = readiness
-			if _, ok := m.workers[key]; ok {
-				logger.V(8).Info("Readiness probe already exists for container",
-					"pod", klog.KObj(pod), "containerName", c.Name)
-				continue
-			}
-			w := newWorker(m, readiness, pod, c)
-			m.workers[key] = w
-			go w.run(ctx)
-		}
+	containers := append(pod.Spec.Containers, getRestartableInitContainers(pod)...)
+	for _, c := range containers {
+		reconcileProbe(c, startup, c.StartupProbe)
+		reconcileProbe(c, readiness, c.ReadinessProbe)
+		reconcileProbe(c, liveness, c.LivenessProbe)
+	}
 
-		if c.LivenessProbe != nil {
-			key.probeType = liveness
-			if _, ok := m.workers[key]; ok {
-				logger.V(8).Info("Liveness probe already exists for container",
-					"pod", klog.KObj(pod), "containerName", c.Name)
-				continue
-			}
-			w := newWorker(m, liveness, pod, c)
-			m.workers[key] = w
-			go w.run(ctx)
+	for key, w := range podWorkers {
+		if !visited.Has(key) {
+			w.stop()
+			delete(podWorkers, key)
 		}
+	}
+
+	if len(podWorkers) == 0 {
+		delete(m.workers, pod.UID)
 	}
 }
 
@@ -233,12 +230,15 @@ func (m *manager) StopLivenessAndStartup(pod *v1.Pod) {
 	m.workerLock.RLock()
 	defer m.workerLock.RUnlock()
 
-	key := probeKey{podUID: pod.UID}
+	podWorkers, ok := m.workers[pod.UID]
+	if !ok {
+		return
+	}
+
 	for _, c := range pod.Spec.Containers {
-		key.containerName = c.Name
 		for _, probeType := range [...]probeType{liveness, startup} {
-			key.probeType = probeType
-			if worker, ok := m.workers[key]; ok {
+			key := containerProbeKey{c.Name, probeType}
+			if worker, ok := podWorkers[key]; ok {
 				worker.stop()
 			}
 		}
@@ -249,12 +249,15 @@ func (m *manager) RemovePod(pod *v1.Pod) {
 	m.workerLock.RLock()
 	defer m.workerLock.RUnlock()
 
-	key := probeKey{podUID: pod.UID}
+	podWorkers, ok := m.workers[pod.UID]
+	if !ok {
+		return
+	}
+
 	for _, c := range append(pod.Spec.Containers, getRestartableInitContainers(pod)...) {
-		key.containerName = c.Name
 		for _, probeType := range [...]probeType{readiness, liveness, startup} {
-			key.probeType = probeType
-			if worker, ok := m.workers[key]; ok {
+			key := containerProbeKey{c.Name, probeType}
+			if worker, ok := podWorkers[key]; ok {
 				worker.stop()
 			}
 		}
@@ -265,9 +268,11 @@ func (m *manager) CleanupPods(desiredPods map[types.UID]sets.Empty) {
 	m.workerLock.RLock()
 	defer m.workerLock.RUnlock()
 
-	for key, worker := range m.workers {
-		if _, ok := desiredPods[key.podUID]; !ok {
-			worker.stop()
+	for podUID, podWorkers := range m.workers {
+		if _, ok := desiredPods[podUID]; !ok {
+			for _, worker := range podWorkers {
+				worker.stop()
+			}
 		}
 	}
 }
@@ -422,7 +427,11 @@ func (m *manager) UpdatePodStatus(ctx context.Context, pod *v1.Pod, podStatus *v
 func (m *manager) getWorker(podUID types.UID, containerName string, probeType probeType) (*worker, bool) {
 	m.workerLock.RLock()
 	defer m.workerLock.RUnlock()
-	worker, ok := m.workers[probeKey{podUID, containerName, probeType}]
+	podWorkers, ok := m.workers[podUID]
+	if !ok {
+		return nil, false
+	}
+	worker, ok := podWorkers[containerProbeKey{containerName, probeType}]
 	return worker, ok
 }
 
@@ -430,14 +439,25 @@ func (m *manager) getWorker(podUID types.UID, containerName string, probeType pr
 func (m *manager) removeWorker(podUID types.UID, containerName string, probeType probeType) {
 	m.workerLock.Lock()
 	defer m.workerLock.Unlock()
-	delete(m.workers, probeKey{podUID, containerName, probeType})
+	podWorkers, ok := m.workers[podUID]
+	if !ok {
+		return
+	}
+	delete(podWorkers, containerProbeKey{containerName, probeType})
+	if len(podWorkers) == 0 {
+		delete(m.workers, podUID)
+	}
 }
 
 // workerCount returns the total number of probe workers. For testing.
 func (m *manager) workerCount() int {
 	m.workerLock.RLock()
 	defer m.workerLock.RUnlock()
-	return len(m.workers)
+	count := 0
+	for _, podWorkers := range m.workers {
+		count += len(podWorkers)
+	}
+	return count
 }
 
 // kubeletRestartGracePeriod returns a time point that is 10 seconds before the kubelet start time.
