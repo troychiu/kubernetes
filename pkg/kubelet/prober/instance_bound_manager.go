@@ -26,8 +26,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/prober/results"
+	kubeutil "k8s.io/kubernetes/pkg/kubelet/util"
 )
 
 // allProbeTypes is the iteration order for whole-container operations.
@@ -92,6 +94,145 @@ func NewInstanceBoundManager(
 		readinessManager: readinessManager,
 		livenessManager:  livenessManager,
 		startupManager:   startupManager,
+	}
+}
+
+// EnsureProbes reconciles the pod's probe workers against the runtime's view of
+// its containers. It is the authoritative, level-triggered half of the design;
+// the container start and kill hooks are a latency optimization on top of it.
+// Reconciliation is what covers everything the hooks structurally cannot: a
+// kubelet restart, for which no container ever "starts", a container that
+// exited on its own, and any edge that was missed.
+//
+// It runs on the pod worker goroutine before the runtime sync, so the runtime
+// state it reads is current as of the start of this sync and no hook for this
+// sync has fired yet. The level and the edge therefore cannot disagree.
+//
+// Three rules, per probe-bearing container:
+//  1. running, and we are already probing this instance: nothing to do.
+//  2. running, and we are not: adopt it -- reconstruct what is known about it
+//     and start probing.
+//  3. not running: stop its workers and forget its results.
+func (m *instanceBoundManager) EnsureProbes(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus) {
+	if podStatus == nil {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, container := range probedContainers(pod) {
+		status := runningContainerStatus(podStatus, container.Name)
+		if status == nil {
+			// Rule 3. The container is gone, was never started, or exited on
+			// its own; either way nothing should still be probing it.
+			m.stopContainerWorkersLocked(ctx, pod.UID, container.Name)
+			continue
+		}
+
+		target := probeTarget{
+			pod:         pod,
+			container:   container,
+			containerID: status.ID,
+			podIPs:      podStatus.IPs,
+			startedAt:   status.StartedAt,
+		}
+
+		if m.tracksContainerLocked(pod.UID, container.Name, status.ID) {
+			// Rule 1. Idempotent: this also fills in any worker the container
+			// has since become eligible for.
+			m.startProbesLocked(ctx, target, false /* adopted */)
+			continue
+		}
+
+		// Rule 2.
+		m.adoptLocked(ctx, target)
+	}
+}
+
+// adoptLocked starts probing a container that is already running but that this
+// manager knows nothing about -- overwhelmingly, one that survived a kubelet
+// restart.
+//
+// There is no persisted probe state, so what the container's probes "were" has
+// to be reconstructed. The one rule is: believe the last thing the kubelet told
+// the API server, and let the first real probe correct it within a period. That
+// is deliberately a rule rather than a heuristic -- it replaces guessing from
+// container start timestamps whether a container predates the kubelet.
+func (m *instanceBoundManager) adoptLocked(ctx context.Context, target probeTarget) {
+	// Trust the reported state only if it is about this same container
+	// instance. An API status with no container ID recorded yet is matched by
+	// name; one naming a different instance tells us nothing about this one.
+	reported := apiContainerStatus(target.pod, target.container.Name)
+	if reported != nil && reported.ContainerID != "" && reported.ContainerID != target.containerID.String() {
+		reported = nil
+	}
+
+	if target.container.StartupProbe != nil {
+		// A container the API says has started stays started, so a kubelet
+		// restart does not re-run a startup probe that already passed and does
+		// not deadlock a sidecar waiting for a result that will never arrive.
+		result := results.Unknown
+		if reported != nil && reported.Started != nil && *reported.Started {
+			result = results.Success
+		}
+		m.startupManager.Seed(target.containerID, result)
+	}
+	if target.container.ReadinessProbe != nil {
+		// A kubelet restart flips Ready in neither direction.
+		result := results.Failure
+		if reported != nil && reported.Ready {
+			result = results.Success
+		}
+		m.readinessManager.Seed(target.containerID, result)
+	}
+	if target.container.LivenessProbe != nil {
+		// Never kill a container over anything that happened before the
+		// restart.
+		m.livenessManager.Seed(target.containerID, results.Success)
+	}
+
+	klog.FromContext(ctx).V(4).Info("Adopting probes for a running container", "pod", klog.KObj(target.pod),
+		"podUID", target.pod.UID, "containerName", target.container.Name, "containerID", target.containerID.String())
+	m.startProbesLocked(ctx, target, true /* adopted */)
+}
+
+// tracksContainerLocked reports whether this manager already knows about a
+// container instance: either it has a worker bound to it, or it has results
+// cached for it. The second case covers a container whose only probe was a
+// startup probe that has already passed, which correctly has no worker left.
+func (m *instanceBoundManager) tracksContainerLocked(podUID types.UID, containerName string, containerID kubecontainer.ContainerID) bool {
+	key := probeKey{podUID: podUID, containerName: containerName}
+	for _, probeType := range allProbeTypes {
+		key.probeType = probeType
+		if w, ok := m.workers[key]; ok && w.containerID == containerID {
+			return true
+		}
+		if _, ok := m.resultsManager(probeType).Get(containerID); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// stopContainerWorkersLocked stops every worker for one container of a pod,
+// whichever instance they are bound to, and forgets their results.
+func (m *instanceBoundManager) stopContainerWorkersLocked(ctx context.Context, podUID types.UID, containerName string) {
+	stale := sets.New[kubecontainer.ContainerID]()
+	key := probeKey{podUID: podUID, containerName: containerName}
+	for _, probeType := range allProbeTypes {
+		key.probeType = probeType
+		w, ok := m.workers[key]
+		if !ok {
+			continue
+		}
+		klog.FromContext(ctx).V(4).Info("Stopping probe worker for a container that is no longer running",
+			"probeType", probeType, "containerName", containerName, "containerID", w.containerID.String())
+		m.stopWorkerLocked(key, w)
+		stale.Insert(w.containerID)
+	}
+	for _, id := range stale.UnsortedList() {
+		m.removeResults(id)
 	}
 }
 
@@ -358,11 +499,149 @@ func (m *instanceBoundManager) startupSucceeded(containerID kubecontainer.Contai
 	return ok && result == results.Success
 }
 
+// UpdatePodStatus fills in Started and Ready for each container from the probe
+// result caches.
+//
+// It is a pure read of those caches. There is no need to consult the worker map
+// to find out whether a probe "has run yet", and no need to poke a worker into
+// probing early, because a worker is only created once it will actually probe,
+// and its cache entry is seeded at creation. Whatever this reads, some worker
+// deliberately put there.
+func (m *instanceBoundManager) UpdatePodStatus(ctx context.Context, pod *v1.Pod, podStatus *v1.PodStatus) {
+	logger := klog.FromContext(ctx)
+
+	for i := range podStatus.ContainerStatuses {
+		containerStatus := &podStatus.ContainerStatuses[i]
+		containerSpec := findContainerSpec(pod.Spec.Containers, containerStatus.Name)
+
+		started := m.isContainerStarted(logger, containerStatus, containerSpec)
+		containerStatus.Started = &started
+		if !started {
+			continue
+		}
+		containerStatus.Ready = m.isContainerReady(logger, containerStatus, containerSpec)
+	}
+
+	for i := range podStatus.InitContainerStatuses {
+		containerStatus := &podStatus.InitContainerStatuses[i]
+
+		initContainer, ok := kubeutil.GetContainerByIndex(pod.Spec.InitContainers, podStatus.InitContainerStatuses, i)
+		if !ok {
+			logger.V(4).Info("Mismatch between pod spec and status, likely programmer error", "pod", klog.KObj(pod), "containerName", containerStatus.Name)
+			continue
+		}
+
+		started := m.isContainerStarted(logger, containerStatus, &initContainer)
+		containerStatus.Started = &started
+
+		if !podutil.IsRestartableInitContainer(&initContainer) {
+			// A plain init container is "ready" once it has done its job.
+			if containerStatus.State.Terminated != nil && containerStatus.State.Terminated.ExitCode == 0 {
+				containerStatus.Ready = true
+			}
+			continue
+		}
+
+		if !started {
+			continue
+		}
+		containerStatus.Ready = m.isContainerReady(logger, containerStatus, &initContainer)
+	}
+}
+
+// isContainerStarted reports whether the container has passed its startup
+// probe, or has no startup probe to pass.
+func (m *instanceBoundManager) isContainerStarted(logger klog.Logger, containerStatus *v1.ContainerStatus, containerSpec *v1.Container) bool {
+	if containerStatus.State.Running == nil {
+		return false
+	}
+	if containerSpec == nil || containerSpec.StartupProbe == nil {
+		return true
+	}
+	result, ok := m.startupManager.Get(kubecontainer.ParseContainerID(logger, containerStatus.ContainerID))
+	return ok && result == results.Success
+}
+
+// isContainerReady reports whether the container is passing its readiness
+// probe, or has no readiness probe to pass. Only call it for a started
+// container.
+func (m *instanceBoundManager) isContainerReady(logger klog.Logger, containerStatus *v1.ContainerStatus, containerSpec *v1.Container) bool {
+	if containerStatus.State.Running == nil {
+		return false
+	}
+	if containerSpec == nil || containerSpec.ReadinessProbe == nil {
+		return true
+	}
+	result, ok := m.readinessManager.Get(kubecontainer.ParseContainerID(logger, containerStatus.ContainerID))
+	return ok && result == results.Success
+}
+
 // workerCount returns the total number of probe workers. For testing.
 func (m *instanceBoundManager) workerCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.workers)
+}
+
+// probedContainers returns the pod's containers that have at least one probe.
+// Restartable init containers are included: they are long-running containers
+// that can be probed like any other, and they are exactly where losing probe
+// state across a kubelet restart is most damaging.
+func probedContainers(pod *v1.Pod) []v1.Container {
+	var probed []v1.Container
+	for _, c := range pod.Spec.Containers {
+		if hasProbe(&c) {
+			probed = append(probed, c)
+		}
+	}
+	for _, c := range pod.Spec.InitContainers {
+		if podutil.IsRestartableInitContainer(&c) && hasProbe(&c) {
+			probed = append(probed, c)
+		}
+	}
+	return probed
+}
+
+func hasProbe(container *v1.Container) bool {
+	return container.ReadinessProbe != nil || container.LivenessProbe != nil || container.StartupProbe != nil
+}
+
+// runningContainerStatus returns the runtime status of the container's running
+// instance, or nil if it has none. A container name can appear more than once
+// in a pod status -- previous, exited instances are reported too -- and only the
+// running one is a thing to probe.
+func runningContainerStatus(podStatus *kubecontainer.PodStatus, containerName string) *kubecontainer.Status {
+	for _, status := range podStatus.ContainerStatuses {
+		if status.Name == containerName && status.State == kubecontainer.ContainerStateRunning {
+			return status
+		}
+	}
+	return nil
+}
+
+// apiContainerStatus returns the container's status as last reported to the API
+// server, which is where adoption reconstructs probe state from.
+func apiContainerStatus(pod *v1.Pod, containerName string) *v1.ContainerStatus {
+	for i, status := range pod.Status.ContainerStatuses {
+		if status.Name == containerName {
+			return &pod.Status.ContainerStatuses[i]
+		}
+	}
+	for i, status := range pod.Status.InitContainerStatuses {
+		if status.Name == containerName {
+			return &pod.Status.InitContainerStatuses[i]
+		}
+	}
+	return nil
+}
+
+func findContainerSpec(containers []v1.Container, containerName string) *v1.Container {
+	for i := range containers {
+		if containers[i].Name == containerName {
+			return &containers[i]
+		}
+	}
+	return nil
 }
 
 func probeSpec(probeType probeType, container *v1.Container) *v1.Probe {
