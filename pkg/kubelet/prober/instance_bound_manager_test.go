@@ -876,3 +876,45 @@ func TestInstanceBoundManagerUpdatePodStatusInitContainers(t *testing.T) {
 		}
 	})
 }
+
+// TestInstanceBoundManagerDoesNotReprobeDoomedContainers checks that a
+// container whose liveness or startup probe has already failed past its
+// threshold is not probed again before the sync loop gets to kill it. Probing
+// again could overwrite the very verdict the sync loop is about to act on.
+func TestInstanceBoundManagerDoesNotReprobeDoomedContainers(t *testing.T) {
+	for _, probeType := range []probeType{liveness, startup} {
+		t.Run(probeType.String(), func(t *testing.T) {
+			ktesting.Init(t).SyncTest("", func(tCtx ktesting.TContext) {
+				m := newTestInstanceBoundManager(tCtx)
+				defer m.CleanupPods(nil)
+				pod := probedTestPod(probeType)
+
+				// The probe has just failed past its threshold, so its worker
+				// recorded the verdict and exited.
+				setTestProbe(pod, probeType, v1.Probe{})
+				startTestProbes(tCtx, m, pod, testID("a"))
+				tCtx.Wait()
+
+				if result, _ := m.resultsManager(probeType).Get(testID("a")); result != results.Failure {
+					tCtx.Fatalf("%v result = %v, want Failure", probeType, result)
+				}
+				if got := m.workerCount(); got != 0 {
+					tCtx.Fatalf("worker count = %d after the verdict, want 0", got)
+				}
+
+				// A sync lands before the container has been killed.
+				m.EnsureProbes(tCtx, pod, runtimePodStatus(testContainerName, testID("a"), kubecontainer.ContainerStateRunning))
+				testExecProber(m).set(probe.Success, nil)
+				time.Sleep(5 * time.Second)
+				tCtx.Wait()
+
+				if got := m.workerCount(); got != 0 {
+					tCtx.Errorf("worker count = %d, want 0: a doomed container was probed again", got)
+				}
+				if result, _ := m.resultsManager(probeType).Get(testID("a")); result != results.Failure {
+					tCtx.Errorf("%v result = %v, want Failure to still stand", probeType, result)
+				}
+			})
+		})
+	}
+}

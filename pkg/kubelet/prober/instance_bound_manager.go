@@ -304,14 +304,24 @@ func (m *instanceBoundManager) ensureWorkerLocked(ctx context.Context, probeType
 		m.stopWorkerLocked(key, w)
 	}
 
+	resultsManager := m.resultsManager(probeType)
+	cached, known := resultsManager.Get(target.containerID)
+
+	if known && isTerminalResult(probeType, cached) {
+		// This probe has already reached a verdict this container instance
+		// cannot come back from: the sync loop is about to kill it. Probing
+		// again could only overwrite the verdict that is about to be acted on,
+		// and the restart brings new workers with it anyway.
+		return
+	}
+
 	// Seed the cache so consumers always find a result for a container that has
 	// a worker: a readiness-probed container is not Ready until it passes, a
 	// liveness-probed one is not killed for a probe that has not run yet, and a
 	// startup-probed one is neither started nor failed. Seeding is skipped if
 	// something already knows better -- adoption fills the cache from the last
 	// state reported to the API before starting workers.
-	resultsManager := m.resultsManager(probeType)
-	if _, ok := resultsManager.Get(target.containerID); !ok {
+	if !known {
 		resultsManager.Set(target.containerID, initialValue(probeType), target.pod)
 	}
 
@@ -665,6 +675,13 @@ func probeSpec(probeType probeType, container *v1.Container) *v1.Probe {
 		return container.StartupProbe
 	}
 	return nil
+}
+
+// isTerminalResult reports whether a result ends probing of a container
+// instance for good. A failed liveness or startup probe gets the container
+// killed, and the replacement is a different instance with its own workers.
+func isTerminalResult(probeType probeType, result results.Result) bool {
+	return (probeType == liveness || probeType == startup) && result == results.Failure
 }
 
 // initialValue is what a probe's result is taken to be before the probe has
