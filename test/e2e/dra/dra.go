@@ -39,6 +39,7 @@ import (
 	resourcealphaapi "k8s.io/api/resource/v1alpha3"
 	resourcev1beta1 "k8s.io/api/resource/v1beta1"
 	resourcev1beta2 "k8s.io/api/resource/v1beta2"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -4827,5 +4828,52 @@ var _ = framework.SIGDescribe("node")(framework.WithLabel("DRA"), func() {
 						})))
 				}).WithTimeout(60 * time.Second).WithPolling(2 * time.Second).Should(gomega.Succeed())
 			})
+	})
+
+	framework.Context("control plane", f.WithFeatureGate(features.DRAPreemption), func() {
+		nodes := drautils.NewNodes(f, 1, 1)
+		driver := drautils.NewDriver(f, nodes, drautils.DriverResources(1))
+		driver.WithKubelet = false
+		b := drautils.NewBuilder(f, driver)
+
+		f.It("preempts lower-priority pod to allocate exclusive device", func(ctx context.Context) {
+			tCtx := f.TContext(ctx)
+			lowPriorityClass := &schedulingv1.PriorityClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "dra-low-priority-" + f.UniqueName,
+				},
+				Value: 100,
+			}
+			highPriorityClass := &schedulingv1.PriorityClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "dra-high-priority-" + f.UniqueName,
+				},
+				Value: 1000,
+			}
+			_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, lowPriorityClass, metav1.CreateOptions{})
+			framework.ExpectNoError(err, "create low PriorityClass")
+			ginkgo.DeferCleanup(f.ClientSet.SchedulingV1().PriorityClasses().Delete, lowPriorityClass.Name, metav1.DeleteOptions{})
+
+			_, err = f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, highPriorityClass, metav1.CreateOptions{})
+			framework.ExpectNoError(err, "create high PriorityClass")
+			ginkgo.DeferCleanup(f.ClientSet.SchedulingV1().PriorityClasses().Delete, highPriorityClass.Name, metav1.DeleteOptions{})
+
+			lowPod, lowTemplate := b.PodInline()
+			lowPod.Name = "low-priority-pod"
+			lowTemplate.Name = "low-priority-template"
+			lowPod.Spec.ResourceClaims[0].ResourceClaimTemplateName = &lowTemplate.Name
+			lowPod.Spec.PriorityClassName = lowPriorityClass.Name
+			lowPod.Spec.TerminationGracePeriodSeconds = ptr.To(int64(0))
+			b.Create(tCtx, lowTemplate, lowPod)
+			b.TestPod(tCtx, lowPod)
+
+			highPod, highTemplate := b.PodInline()
+			highPod.Name = "high-priority-pod"
+			highTemplate.Name = "high-priority-template"
+			highPod.Spec.ResourceClaims[0].ResourceClaimTemplateName = &highTemplate.Name
+			highPod.Spec.PriorityClassName = highPriorityClass.Name
+			b.Create(tCtx, highTemplate, highPod)
+			b.TestPod(tCtx, highPod)
+		})
 	})
 })

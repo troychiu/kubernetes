@@ -285,6 +285,7 @@ func run(tCtx ktesting.TContext, whatRE string) {
 				features.DRAListTypeAttributes:        true,
 				features.DRAOptionalNodeOperations:    true,
 				features.DRAPartitionableDevices:      true,
+				features.DRAPreemption:                true,
 				features.DRAPrioritizedList:           true,
 				features.DRAResourceClaimDeviceStatus: true,
 				features.DRAExtendedResource:          true,
@@ -329,6 +330,7 @@ func run(tCtx ktesting.TContext, whatRE string) {
 				runSubTest(tCtx, "UsesAllResources", testUsesAllResources)
 				runSubTest(tCtx, "DRANodeAllocatableResources", func(tCtx ktesting.TContext) { testNodeAllocatableResources(tCtx, true) })
 				runSubTest(tCtx, "PodGroup", testPodGroup)
+				runSubTest(tCtx, "Preemption", testPreemption)
 				runSubTest(tCtx, "WorkloadResourceClaims", func(tCtx ktesting.TContext) { testWorkloadResourceClaims(tCtx, true, true) })
 			},
 		},

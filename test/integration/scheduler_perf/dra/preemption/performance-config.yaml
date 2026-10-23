@@ -1,0 +1,66 @@
+# The following labels are used in this file. (listed in ascending order of the number of covered test cases)
+#
+# - integration-test: test cases to run as the integration test, usually to spot some issues in the scheduler implementation or scheduler-perf itself.
+# - performance: test cases to run in the performance test.
+# - short: supplemental label for the above two labels (must not used alone), which literally means short execution time test cases.
+
+# PreemptionWithResourceClaimTemplate saturates DRA nodes with low-priority pods
+# using a ResourceClaimTemplate (10 devices per node), then schedules high-priority
+# pods that must preempt the low-priority pods and wait for their claims to settle
+# before allocating the freed devices.
+- name: PreemptionWithResourceClaimTemplate
+  featureGates:
+    DRAPreemption: true
+  workloadTemplate:
+  - opcode: createNodes
+    countParam: $nodesWithoutDRA
+  - opcode: createNodes
+    nodeTemplatePath: ../templates/node-with-dra-test-driver.yaml
+    countParam: $nodesWithDRA
+  - opcode: createAny
+    # one ResourceSlice with 10 devices
+    templatePath: ../templates/resourceslice-basic-devices.yaml
+    countParam: $nodesWithDRA
+    templateParams:
+      numPCIRoots: 2
+      numDevices: 10
+  - opcode: createAny
+    templatePath: ../templates/deviceclass.yaml
+  - opcode: createAny
+    templatePath: ../templates/resourceclaimtemplate.yaml
+    namespace: init
+    templateParams:
+      numRequests: 1
+      selectors:
+      constraints:
+  - opcode: createAny
+    templatePath: ../templates/resourceclaimtemplate.yaml
+    namespace: test
+    templateParams:
+      numRequests: 1
+      selectors:
+      constraints:
+  - opcode: createPods
+    namespace: init
+    countParam: $initPods
+    podTemplatePath: ../templates/pod-with-claim-template-low-priority.yaml
+  - opcode: createPods
+    namespace: test
+    countParam: $measurePods
+    podTemplatePath: ../templates/pod-with-claim-template-high-priority.yaml
+    collectMetrics: true
+  workloads:
+  - name: fast
+    labels: [integration-test, short]
+    params:
+      nodesWithDRA: 1
+      nodesWithoutDRA: 1
+      initPods: 10
+      measurePods: 5
+  - name: 100nodes
+    labels: [performance]
+    params:
+      nodesWithDRA: 100
+      nodesWithoutDRA: 0
+      initPods: 1000
+      measurePods: 500
