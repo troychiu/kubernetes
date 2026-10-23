@@ -501,6 +501,22 @@ type EnqueueExtensions interface {
 	EventsToRegister(context.Context) ([]ClusterEventWithHint, error)
 }
 
+// NominationExtensions is an optional interface for plugins that manage
+// resources requiring explicit reservation for nominated pods and/or
+// asynchronous reclamation when victim pods are preempted.
+type NominationExtensions interface {
+	Plugin
+	// AddNominatedPod is called when preemption selects a winning candidate for a pod.
+	// state is the scheduling cycle's CycleState.
+	AddNominatedPod(ctx context.Context, state CycleState, pod *v1.Pod, nodeName string, victims []*v1.Pod)
+	// RemoveNominatedPod is called when a pod's nomination is cleared or superseded.
+	RemoveNominatedPod(ctx context.Context, pod *v1.Pod)
+	// PodEligibleToPreempt reports whether a pod with an existing nominatedNodeName
+	// is eligible to start a new preemption, or whether resources freed by an earlier
+	// preemption on nodeName are still being reclaimed.
+	PodEligibleToPreempt(ctx context.Context, pod *v1.Pod, nodeName string) (bool, string)
+}
+
 // PreFilterExtensions is an interface that is included in plugins that allow specifying
 // callbacks to make incremental updates to its supposedly pre-calculated
 // state.
@@ -1125,4 +1141,14 @@ type PluginsRunner interface {
 	// RunReservePluginsUnreserve runs the Unreserve method of the set of
 	// configured Reserve plugins.
 	RunReservePluginsUnreserve(ctx context.Context, state CycleState, pod *v1.Pod, nodeName string)
+	// RunNominationExtensionsAddNominatedPod calls the AddNominatedPod interface
+	// for the set of configured NominationExtensions plugins.
+	RunNominationExtensionsAddNominatedPod(ctx context.Context, state CycleState, pod *v1.Pod, nodeName string, victims []*v1.Pod)
+	// RunNominationExtensionsRemoveNominatedPod calls the RemoveNominatedPod interface
+	// for the set of configured NominationExtensions plugins.
+	RunNominationExtensionsRemoveNominatedPod(ctx context.Context, pod *v1.Pod)
+	// RunNominationExtensionsPodEligibleToPreempt calls the PodEligibleToPreempt interface
+	// for the set of configured NominationExtensions plugins. It returns false and the
+	// reason from the first plugin that reports the pod is not eligible to preempt.
+	RunNominationExtensionsPodEligibleToPreempt(ctx context.Context, pod *v1.Pod, nodeName string) (bool, string)
 }

@@ -17,6 +17,7 @@ limitations under the License.
 package queue
 
 import (
+	"context"
 	"slices"
 	"sync"
 
@@ -50,13 +51,45 @@ type nominator struct {
 	// nominatedPodToNode is map keyed by a Pod UID to the node name where it is
 	// nominated.
 	nominatedPodToNode map[types.UID]string
+	// nominationRemovalHandlers maps a scheduler profile name to a callback
+	// invoked whenever a pod's nomination is removed or replaced.
+	nominationRemovalHandlers map[string]func(ctx context.Context, pod *v1.Pod)
 }
 
 func newPodNominator(podLister listersv1.PodLister) *nominator {
 	return &nominator{
-		podLister:          podLister,
-		nominatedPods:      make(map[string][]podRef),
-		nominatedPodToNode: make(map[types.UID]string),
+		podLister:                 podLister,
+		nominatedPods:             make(map[string][]podRef),
+		nominatedPodToNode:        make(map[types.UID]string),
+		nominationRemovalHandlers: make(map[string]func(ctx context.Context, pod *v1.Pod)),
+	}
+}
+
+// AddNominationRemovalHandler registers a callback for a scheduler profile that is
+// invoked whenever a pod's nomination is removed or replaced in the nominator.
+func (npm *nominator) AddNominationRemovalHandler(profileName string, handler func(ctx context.Context, pod *v1.Pod)) {
+	npm.nLock.Lock()
+	defer npm.nLock.Unlock()
+	if npm.nominationRemovalHandlers == nil {
+		npm.nominationRemovalHandlers = make(map[string]func(ctx context.Context, pod *v1.Pod))
+	}
+	npm.nominationRemovalHandlers[profileName] = handler
+}
+
+func (npm *nominator) notifyNominationRemoved(pod *v1.Pod) {
+	if pod == nil {
+		return
+	}
+	npm.nLock.RLock()
+	handler, ok := npm.nominationRemovalHandlers[pod.Spec.SchedulerName]
+	if !ok && len(npm.nominationRemovalHandlers) == 1 {
+		for _, h := range npm.nominationRemovalHandlers {
+			handler = h
+		}
+	}
+	npm.nLock.RUnlock()
+	if handler != nil {
+		handler(context.Background(), pod)
 	}
 }
 
@@ -64,13 +97,16 @@ func newPodNominator(podLister listersv1.PodLister) *nominator {
 // This is called during the preemption process when a node is nominated to run
 // the pod. We update the nominator's structure before sending an API request to update the pod
 // object, to avoid races with the following scheduling cycles.
-func (npm *nominator) addNominatedPod(logger klog.Logger, pi fwk.PodInfo, nominatingInfo *fwk.NominatingInfo) {
+// It returns true if an existing nomination for the pod was cleared or replaced.
+func (npm *nominator) addNominatedPod(logger klog.Logger, pi fwk.PodInfo, nominatingInfo *fwk.NominatingInfo) bool {
 	npm.nLock.Lock()
-	npm.addNominatedPodUnlocked(logger, pi, nominatingInfo)
+	removed := npm.addNominatedPodUnlocked(logger, pi, nominatingInfo)
 	npm.nLock.Unlock()
+	return removed
 }
 
-func (npm *nominator) addNominatedPodUnlocked(logger klog.Logger, pi fwk.PodInfo, nominatingInfo *fwk.NominatingInfo) {
+func (npm *nominator) addNominatedPodUnlocked(logger klog.Logger, pi fwk.PodInfo, nominatingInfo *fwk.NominatingInfo) bool {
+	oldNodeName, hadNomination := npm.nominatedPodToNode[pi.GetPod().UID]
 	// Always delete the pod if it already exists, to ensure we never store more than
 	// one instance of the pod.
 	npm.deleteUnlocked(pi.GetPod())
@@ -84,7 +120,7 @@ func (npm *nominator) addNominatedPodUnlocked(logger klog.Logger, pi fwk.PodInfo
 
 	// Empty nodeName clears nomination; do not key nominatedPods by "".
 	if nodeName == "" {
-		return
+		return hadNomination
 	}
 
 	if npm.podLister != nil {
@@ -92,11 +128,11 @@ func (npm *nominator) addNominatedPodUnlocked(logger klog.Logger, pi fwk.PodInfo
 		updatedPod, err := npm.podLister.Pods(pi.GetPod().Namespace).Get(pi.GetPod().Name)
 		if err != nil {
 			logger.V(4).Info("Pod doesn't exist in podLister, aborted adding it to the nominator", "pod", klog.KObj(pi.GetPod()))
-			return
+			return hadNomination
 		}
 		if updatedPod.Spec.NodeName != "" {
 			logger.V(4).Info("Pod is already scheduled to a node, aborted adding it to the nominator", "pod", klog.KObj(pi.GetPod()), "node", updatedPod.Spec.NodeName)
-			return
+			return hadNomination
 		}
 	}
 
@@ -104,14 +140,21 @@ func (npm *nominator) addNominatedPodUnlocked(logger klog.Logger, pi fwk.PodInfo
 	for _, np := range npm.nominatedPods[nodeName] {
 		if np.uid == pi.GetPod().UID {
 			logger.V(4).Info("Pod already exists in the nominator", "pod", np.uid)
-			return
+			return hadNomination && nodeName != oldNodeName
 		}
 	}
 	npm.nominatedPods[nodeName] = append(npm.nominatedPods[nodeName], podToRef(pi.GetPod()))
+	return hadNomination && nodeName != oldNodeName
 }
 
 // UpdateNominatedPod updates the <oldPod> with <newPod>.
 func (npm *nominator) UpdateNominatedPod(logger klog.Logger, oldPod *v1.Pod, newPodInfo fwk.PodInfo) {
+	if npm.updateNominatedPod(logger, oldPod, newPodInfo) {
+		npm.notifyNominationRemoved(oldPod)
+	}
+}
+
+func (npm *nominator) updateNominatedPod(logger klog.Logger, oldPod *v1.Pod, newPodInfo fwk.PodInfo) bool {
 	npm.nLock.Lock()
 	defer npm.nLock.Unlock()
 	// In some cases, an Update event with no "NominatedNode" present is received right
@@ -131,23 +174,33 @@ func (npm *nominator) UpdateNominatedPod(logger klog.Logger, oldPod *v1.Pod, new
 			}
 		}
 	}
+	oldNodeName, hadNomination := npm.nominatedPodToNode[oldPod.UID]
 	// We update irrespective of the nominatedNodeName changed or not, to ensure
 	// that pod pointer is updated.
 	npm.deleteUnlocked(oldPod)
 	npm.addNominatedPodUnlocked(logger, newPodInfo, nominatingInfo)
+	newNodeName := npm.nominatedPodToNode[newPodInfo.GetPod().UID]
+	return hadNomination && newNodeName != oldNodeName
 }
 
 // DeleteNominatedPodIfExists deletes <pod> from nominatedPods.
 func (npm *nominator) DeleteNominatedPodIfExists(pod *v1.Pod) {
-	npm.nLock.Lock()
-	npm.deleteUnlocked(pod)
-	npm.nLock.Unlock()
+	if npm.delete(pod) {
+		npm.notifyNominationRemoved(pod)
+	}
 }
 
-func (npm *nominator) deleteUnlocked(p *v1.Pod) {
+func (npm *nominator) delete(pod *v1.Pod) bool {
+	npm.nLock.Lock()
+	removed := npm.deleteUnlocked(pod)
+	npm.nLock.Unlock()
+	return removed
+}
+
+func (npm *nominator) deleteUnlocked(p *v1.Pod) bool {
 	nnn, ok := npm.nominatedPodToNode[p.UID]
 	if !ok {
-		return
+		return false
 	}
 	for i, np := range npm.nominatedPods[nnn] {
 		if np.uid == p.UID {
@@ -159,6 +212,7 @@ func (npm *nominator) deleteUnlocked(p *v1.Pod) {
 		}
 	}
 	delete(npm.nominatedPodToNode, p.UID)
+	return true
 }
 
 func (npm *nominator) nominatedPodsForNode(nodeName string) []podRef {

@@ -254,12 +254,16 @@ func (e *Executor) prepareCandidateAsync(c fwk.PreemptionCandidate, preemptor Ex
 		// nomination updates these pods and moves them to the active queue. It
 		// lets scheduler find another place for them sooner than after waiting for preemption completion.
 		nominatedPods := getLowerPriorityNominatedPods(logger, e.fh, preemptor.Priority(), c.Nodes())
+		for _, p := range nominatedPods {
+			e.fh.RunNominationExtensionsRemoveNominatedPod(ctx, p)
+		}
 		if err := clearNominatedNodeName(ctx, e.fh.ClientSet(), e.fh.APICacher(), nominatedPods...); err != nil {
 			utilruntime.HandleErrorWithContext(ctx, err, "Cannot clear 'NominatedNodeName' field from lower priority pods on the same target node", "node", c.Name())
 			result = metrics.GoroutineResultError
 			// We do not return as this error is not critical.
 		}
 
+		victimEvictionFailed := false
 		preemptLastVictim := true
 		if len(victimPods) > 1 {
 			// In order to prevent requesting preemption of the same pod multiple times for the same preemptor,
@@ -276,6 +280,7 @@ func (e *Executor) prepareCandidateAsync(c fwk.PreemptionCandidate, preemptor Ex
 			if err := errCh.Receive(); err != nil {
 				utilruntime.HandleErrorWithContext(ctx, err, "Error occurred during async preemption")
 				result = metrics.GoroutineResultError
+				victimEvictionFailed = true
 				preemptLastVictim = false
 			}
 		}
@@ -293,8 +298,15 @@ func (e *Executor) prepareCandidateAsync(c fwk.PreemptionCandidate, preemptor Ex
 			if err != nil {
 				utilruntime.HandleErrorWithContext(ctx, err, "Error occurred during async preemption of the last victim")
 				result = metrics.GoroutineResultError
+				victimEvictionFailed = true
 			} else if preemptedInMemory {
 				preemptedLastVictimInMemory = true
+			}
+		}
+		if victimEvictionFailed {
+			for _, pod := range preemptor.Pods() {
+				e.fh.DeleteNominatedPodIfExists(pod)
+				e.fh.RunNominationExtensionsRemoveNominatedPod(ctx, pod)
 			}
 		}
 		e.mu.Lock()
@@ -346,6 +358,9 @@ func (e *Executor) prepareCandidate(ctx context.Context, c fwk.PreemptionCandida
 	// nomination updates these pods and moves them to the active queue. It
 	// lets scheduler find another place for them sooner than after waiting for preemption completion.
 	nominatedPods := getLowerPriorityNominatedPods(logger, fh, preemptor.Priority(), c.Nodes())
+	for _, p := range nominatedPods {
+		fh.RunNominationExtensionsRemoveNominatedPod(ctx, p)
+	}
 	if err := clearNominatedNodeName(ctx, cs, fh.APICacher(), nominatedPods...); err != nil {
 		utilruntime.HandleErrorWithContext(ctx, err, "Cannot clear 'NominatedNodeName' field")
 		// We do not return as this error is not critical.

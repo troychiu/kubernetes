@@ -106,7 +106,7 @@ var (
 
 	nominatorCmpOpts = []cmp.Option{
 		cmp.AllowUnexported(nominator{}, podRef{}),
-		cmpopts.IgnoreFields(nominator{}, "podLister", "nLock"),
+		cmpopts.IgnoreFields(nominator{}, "podLister", "nLock", "nominationRemovalHandlers"),
 	}
 
 	queueHintReturnQueue = func(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
@@ -11078,5 +11078,100 @@ func TestPreQueueingHint_PerPluginNarrowing(t *testing.T) {
 	}
 	if !slices.Contains(pluginBQueueingHintCalled, "pod2") {
 		t.Errorf("pluginB QueueingHintFn should be called for pod2, called for: %v", pluginBQueueingHintCalled)
+	}
+}
+
+func TestPriorityQueue_NominationRemovalHandlers(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	pod1 := st.MakePod().Name("pod1").Namespace("ns1").UID("uid1").SchedulerName(v1.DefaultSchedulerName).Obj()
+	pod1Info := mustNewTestPodInfo(t, pod1)
+	pod2Nominated := st.MakePod().Name("pod2").Namespace("ns1").UID("uid2").SchedulerName(v1.DefaultSchedulerName).NominatedNodeName("node1").Obj()
+	pod3Nominated := st.MakePod().Name("pod3").Namespace("ns1").UID("uid3").SchedulerName(v1.DefaultSchedulerName).NominatedNodeName("node1").Obj()
+	pod4Nominated := st.MakePod().Name("pod4").Namespace("ns1").UID("uid4").SchedulerName(v1.DefaultSchedulerName).NominatedNodeName("node1").Obj()
+
+	objs := []runtime.Object{pod1, pod2Nominated, pod3Nominated, pod4Nominated}
+	q := NewTestQueueWithObjects(ctx, newDefaultQueueSort(), objs)
+
+	var removedPods []string
+	var otherProfileRemovedPods []string
+	q.AddNominationRemovalHandler(v1.DefaultSchedulerName, func(ctx context.Context, pod *v1.Pod) {
+		removedPods = append(removedPods, pod.Name)
+		// Verify that PriorityQueue.lock and nominator.nLock are not held by invoking a method that acquires them.
+		_ = q.NominatedPodsForNode(klog.FromContext(ctx), "node1")
+		q.MoveAllToActiveOrBackoffQueue(klog.FromContext(ctx), nodeAdd, nil, nil, nil)
+	})
+	q.AddNominationRemovalHandler("other-scheduler", func(_ context.Context, pod *v1.Pod) {
+		otherProfileRemovedPods = append(otherProfileRemovedPods, pod.Name)
+	})
+
+	// Initial nomination does not trigger removal handler.
+	q.AddNominatedPod(logger, pod1Info, &fwk.NominatingInfo{NominatingMode: fwk.ModeOverride, NominatedNodeName: "node1"})
+	if len(removedPods) != 0 {
+		t.Fatalf("unexpected removal callback on initial nomination: %v", removedPods)
+	}
+
+	// Re-nominating on the same node or ModeNoop (with matching Status.NominatedNodeName) does not trigger removal handler.
+	q.AddNominatedPod(logger, pod1Info, &fwk.NominatingInfo{NominatingMode: fwk.ModeOverride, NominatedNodeName: "node1"})
+	pod1WithNNN := pod1.DeepCopy()
+	pod1WithNNN.Status.NominatedNodeName = "node1"
+	q.AddNominatedPod(logger, mustNewTestPodInfo(t, pod1WithNNN), &fwk.NominatingInfo{NominatingMode: fwk.ModeNoop})
+	if len(removedPods) != 0 {
+		t.Fatalf("unexpected removal callback on same-node/noop nomination: %v", removedPods)
+	}
+
+	// Changing nominated node triggers removal handler for the previous nomination.
+	q.AddNominatedPod(logger, pod1Info, &fwk.NominatingInfo{NominatingMode: fwk.ModeOverride, NominatedNodeName: "node2"})
+	if diff := cmp.Diff([]string{"pod1"}, removedPods); diff != "" {
+		t.Fatalf("unexpected removed pods after node change (-want, +got):\n%s", diff)
+	}
+	removedPods = nil
+
+	// Clearing nomination via ModeOverride with empty node triggers removal handler.
+	q.AddNominatedPod(logger, pod1Info, &fwk.NominatingInfo{NominatingMode: fwk.ModeOverride, NominatedNodeName: ""})
+	if diff := cmp.Diff([]string{"pod1"}, removedPods); diff != "" {
+		t.Fatalf("unexpected removed pods after clearing nomination (-want, +got):\n%s", diff)
+	}
+	removedPods = nil
+
+	// DeleteNominatedPodIfExists triggers removal handler once.
+	q.AddNominatedPod(logger, pod1Info, &fwk.NominatingInfo{NominatingMode: fwk.ModeOverride, NominatedNodeName: "node1"})
+	q.DeleteNominatedPodIfExists(pod1)
+	q.DeleteNominatedPodIfExists(pod1)
+	if diff := cmp.Diff([]string{"pod1"}, removedPods); diff != "" {
+		t.Fatalf("unexpected removed pods after DeleteNominatedPodIfExists (-want, +got):\n%s", diff)
+	}
+	removedPods = nil
+
+	// Update clearing NominatedNodeName triggers removal handler.
+	q.Add(ctx, pod2Nominated)
+	pod2Cleared := pod2Nominated.DeepCopy()
+	pod2Cleared.Status.NominatedNodeName = ""
+	q.Update(ctx, pod2Nominated, pod2Cleared)
+	if diff := cmp.Diff([]string{"pod2"}, removedPods); diff != "" {
+		t.Fatalf("unexpected removed pods after Update clearing NominatedNodeName (-want, +got):\n%s", diff)
+	}
+	removedPods = nil
+
+	// Update changing NominatedNodeName to another node triggers removal handler for the previous nomination.
+	q.Add(ctx, pod3Nominated)
+	pod3ReNominated := pod3Nominated.DeepCopy()
+	pod3ReNominated.Status.NominatedNodeName = "node2"
+	q.Update(ctx, pod3Nominated, pod3ReNominated)
+	if diff := cmp.Diff([]string{"pod3"}, removedPods); diff != "" {
+		t.Fatalf("unexpected removed pods after Update changing NominatedNodeName (-want, +got):\n%s", diff)
+	}
+	removedPods = nil
+
+	// Delete of a nominated pod triggers removal handler.
+	q.Add(ctx, pod4Nominated)
+	q.Delete(logger, pod4Nominated)
+	if diff := cmp.Diff([]string{"pod4"}, removedPods); diff != "" {
+		t.Fatalf("unexpected removed pods after Delete (-want, +got):\n%s", diff)
+	}
+	if len(otherProfileRemovedPods) != 0 {
+		t.Fatalf("unexpected callback for other profile: %v", otherProfileRemovedPods)
 	}
 }

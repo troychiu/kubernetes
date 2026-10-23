@@ -150,6 +150,10 @@ type SchedulingQueue interface {
 	// This method should be used only if the SchedulerAsyncAPICalls feature gate is enabled.
 	PatchPodStatus(pod *v1.Pod, conditions []*v1.PodCondition, nominatingInfo *fwk.NominatingInfo) (<-chan error, error)
 
+	// AddNominationRemovalHandler registers a callback for a scheduler profile that is
+	// invoked whenever a pod's nomination is removed or replaced in the nominator.
+	AddNominationRemovalHandler(profileName string, handler func(ctx context.Context, pod *v1.Pod))
+
 	// The following functions are supposed to be used only for testing or debugging.
 	GetPodGroup(name, namespace string) (*framework.QueuedPodGroupInfo, bool)
 	GetPod(ctx context.Context, name, namespace string, schedulingGroup *v1.PodSchedulingGroup) (*framework.QueuedPodInfo, bool)
@@ -799,8 +803,11 @@ func (p *PriorityQueue) runPreEnqueuePlugin(ctx context.Context, pl fwk.PreEnque
 // It locks the PriorityQueue to make sure it won't race with any other method.
 func (p *PriorityQueue) AddNominatedPod(logger klog.Logger, pi fwk.PodInfo, nominatingInfo *fwk.NominatingInfo) {
 	p.lock.Lock()
-	p.nominator.addNominatedPod(logger, pi, nominatingInfo)
+	removed := p.nominator.addNominatedPod(logger, pi, nominatingInfo)
 	p.lock.Unlock()
+	if removed {
+		p.nominator.notifyNominationRemoved(pi.GetPod())
+	}
 }
 
 // moveToActiveQ tries to add the entity to the active queue.
@@ -1371,6 +1378,12 @@ func (p *PriorityQueue) InFlightPods() []*v1.Pod {
 // become schedulable and adds the updated one to the active queue.
 // If pod is not present in any of the queues, it is added to the active queue.
 func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
+	var nominationRemoved bool
+	defer func() {
+		if nominationRemoved {
+			p.nominator.notifyNominationRemoved(oldPod)
+		}
+	}()
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	logger := klog.FromContext(ctx)
@@ -1384,7 +1397,7 @@ func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
 		entityLookup, hasRoot = p.workloadForest.getRootLookupInfoForPod(logger, oldPod)
 		if !hasRoot {
 			if pInfo := p.incompletePodGroupPods.update(newPod); pInfo != nil {
-				p.UpdateNominatedPod(logger, oldPod, pInfo.PodInfo)
+				nominationRemoved = p.updateNominatedPod(logger, oldPod, pInfo.PodInfo)
 				pInfo.PodSignature = p.signPod(ctx, newPod)
 			}
 			return
@@ -1411,7 +1424,7 @@ func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
 		}
 		// If the entity is already in the active queue, just update the pod there.
 		if pInfo := unlockedActiveQ.update(newPod, entityLookup); pInfo != nil {
-			p.UpdateNominatedPod(logger, oldPod, pInfo.PodInfo)
+			nominationRemoved = p.updateNominatedPod(logger, oldPod, pInfo.PodInfo)
 			pInfo.PodSignature = p.signPod(ctx, newPod)
 			updated = true
 			return
@@ -1419,7 +1432,7 @@ func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
 
 		// If the entity is in the backoff queue, update the pod there.
 		if pInfo := p.backoffQ.update(newPod, entityLookup); pInfo != nil {
-			p.UpdateNominatedPod(logger, oldPod, pInfo.PodInfo)
+			nominationRemoved = p.updateNominatedPod(logger, oldPod, pInfo.PodInfo)
 			pInfo.PodSignature = p.signPod(ctx, newPod)
 			updated = true
 			return
@@ -1439,7 +1452,7 @@ func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
 			p.addPod(ctx, newPod)
 			return
 		}
-		p.UpdateNominatedPod(logger, oldPod, pInfo.PodInfo)
+		nominationRemoved = p.updateNominatedPod(logger, oldPod, pInfo.PodInfo)
 		pInfo.PodSignature = p.signPod(ctx, newPod)
 
 		// When unscheduled Pods are updated, we check with QueueingHint
@@ -1466,7 +1479,7 @@ func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
 
 	if p.isPodGroupMember(newPod) {
 		if pInfo := p.pendingPodGroupPods.update(newPod); pInfo != nil {
-			p.UpdateNominatedPod(logger, oldPod, pInfo.PodInfo)
+			nominationRemoved = p.updateNominatedPod(logger, oldPod, pInfo.PodInfo)
 			pInfo.PodSignature = p.signPod(ctx, newPod)
 			return
 		}
@@ -1488,10 +1501,16 @@ func decreaseUnschedulableReasonMetric(entity framework.QueuedEntityInfo) {
 // Delete deletes the entity from activeQ, backoffQ or unschedulableEntities.
 // It assumes the pod is only in one structure.
 func (p *PriorityQueue) Delete(logger klog.Logger, pod *v1.Pod) {
+	var nominationRemoved bool
+	defer func() {
+		if nominationRemoved {
+			p.nominator.notifyNominationRemoved(pod)
+		}
+	}()
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	p.DeleteNominatedPodIfExists(pod)
+	nominationRemoved = p.nominator.delete(pod)
 	if p.isPodGroupMember(pod) {
 		p.deletePodGroupMember(logger, pod)
 	} else {

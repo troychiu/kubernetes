@@ -2435,6 +2435,31 @@ func TestCustomOrdering(t *testing.T) {
 	}
 }
 
+type fakeNominationExtensionsPlugin struct {
+	eligible bool
+}
+
+func (f *fakeNominationExtensionsPlugin) Name() string {
+	return "fake-nomination-ext"
+}
+
+func (f *fakeNominationExtensionsPlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
+	return nil
+}
+
+func (f *fakeNominationExtensionsPlugin) AddNominatedPod(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ string, _ []*v1.Pod) {
+}
+
+func (f *fakeNominationExtensionsPlugin) RemoveNominatedPod(_ context.Context, _ *v1.Pod) {
+}
+
+func (f *fakeNominationExtensionsPlugin) PodEligibleToPreempt(_ context.Context, _ *v1.Pod, _ string) (bool, string) {
+	if !f.eligible {
+		return false, "waiting for resources on nominated node"
+	}
+	return true, ""
+}
+
 func TestPodEligibleToPreemptOthers(t *testing.T) {
 	tests := []struct {
 		name                string
@@ -2445,6 +2470,7 @@ func TestPodEligibleToPreemptOthers(t *testing.T) {
 		nodes               []string
 		features            feature.Features
 		nominatedNodeStatus *fwk.Status
+		nomExtEligible      *bool
 		expected            bool
 	}{
 		{
@@ -2516,6 +2542,24 @@ func TestPodEligibleToPreemptOthers(t *testing.T) {
 			features: feature.Features{EnableGenericWorkload: true},
 			expected: false,
 		},
+		{
+			name:                "NominationExtensions plugin reports pod ineligible on nominated node",
+			pod:                 st.MakePod().Name("p_with_nominated_node").UID("p").Priority(highPriority).NominatedNodeName("node1").Obj(),
+			pods:                []*v1.Pod{},
+			nodes:               []string{"node1"},
+			nominatedNodeStatus: fwk.NewStatus(fwk.Unschedulable),
+			nomExtEligible:      new(false),
+			expected:            false,
+		},
+		{
+			name:                "NominationExtensions plugin reports pod eligible on nominated node",
+			pod:                 st.MakePod().Name("p_with_nominated_node").UID("p").Priority(highPriority).NominatedNodeName("node1").Obj(),
+			pods:                []*v1.Pod{},
+			nodes:               []string{"node1"},
+			nominatedNodeStatus: fwk.NewStatus(fwk.Unschedulable),
+			nomExtEligible:      new(true),
+			expected:            true,
+		},
 	}
 
 	for _, test := range tests {
@@ -2553,6 +2597,12 @@ func TestPodEligibleToPreemptOthers(t *testing.T) {
 			registeredPlugins := []tf.RegisterPluginFunc{
 				tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
 				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+			}
+			if test.nomExtEligible != nil {
+				eligible := *test.nomExtEligible
+				registeredPlugins = append(registeredPlugins, tf.RegisterFilterPlugin("fake-nomination-ext", func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+					return &fakeNominationExtensionsPlugin{eligible: eligible}, nil
+				}))
 			}
 			cache := internalcache.New(ctx, nil, test.features.EnableGenericWorkload, test.features.EnableCompositePodGroup)
 			for _, pg := range test.podGroups {

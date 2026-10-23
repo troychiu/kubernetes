@@ -5875,3 +5875,130 @@ func newQueuedPodGroupInfoForTest(ns, name string) *framework.QueuedPodGroupInfo
 		},
 	}
 }
+
+type testNominationExtensionsPlugin struct {
+	name     string
+	eligible bool
+	events   *[]string
+}
+
+var _ fwk.FilterPlugin = &testNominationExtensionsPlugin{}
+var _ fwk.NominationExtensions = &testNominationExtensionsPlugin{}
+
+func (pl *testNominationExtensionsPlugin) Name() string {
+	return pl.name
+}
+
+func (pl *testNominationExtensionsPlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
+	return nil
+}
+
+func (pl *testNominationExtensionsPlugin) AddNominatedPod(_ context.Context, _ fwk.CycleState, pod *v1.Pod, nodeName string, victims []*v1.Pod) {
+	*pl.events = append(*pl.events, fmt.Sprintf("%s:add:%s:%s:%d", pl.name, pod.Name, nodeName, len(victims)))
+}
+
+func (pl *testNominationExtensionsPlugin) RemoveNominatedPod(_ context.Context, pod *v1.Pod) {
+	*pl.events = append(*pl.events, fmt.Sprintf("%s:remove:%s", pl.name, pod.Name))
+}
+
+func (pl *testNominationExtensionsPlugin) PodEligibleToPreempt(_ context.Context, pod *v1.Pod, nodeName string) (bool, string) {
+	*pl.events = append(*pl.events, fmt.Sprintf("%s:eligible:%s:%s", pl.name, pod.Name, nodeName))
+	if !pl.eligible {
+		return false, pl.name + " ineligible"
+	}
+	return true, ""
+}
+
+func TestNominationExtensions(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var events []string
+	plB := &testNominationExtensionsPlugin{name: "nom-b", eligible: true, events: &events}
+	plA := &testNominationExtensionsPlugin{name: "nom-a", eligible: true, events: &events}
+
+	registry := Registry{}
+	for _, pl := range []*testNominationExtensionsPlugin{plB, plA} {
+		p := pl
+		if err := registry.Register(p.name, func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+			return p, nil
+		}); err != nil {
+			t.Fatalf("failed to register plugin %s: %v", p.name, err)
+		}
+	}
+
+	cfgPls := &config.Plugins{}
+	// Register in reverse alphabetical order to verify deterministic sorting by plugin name.
+	cfgPls.Filter.Enabled = []config.Plugin{{Name: "nom-b"}, {Name: "nom-a"}}
+	profile := config.KubeSchedulerProfile{
+		SchedulerName: testProfileName,
+		Plugins:       cfgPls,
+	}
+
+	testPod := st.MakePod().Name("preemptor").Namespace("ns1").UID("p-uid").SchedulerName(testProfileName).Obj()
+	victim := st.MakePod().Name("victim").Namespace("ns1").UID("v-uid").Obj()
+	state := framework.NewCycleState()
+
+	informerFactory := informers.NewSharedInformerFactory(clientsetfake.NewClientset(testPod), 0)
+	_ = informerFactory.Core().V1().Pods().Informer().GetStore().Add(testPod)
+	q := internalqueue.NewSchedulingQueue(nil, informerFactory)
+	f, err := newFrameworkWithQueueSortAndBind(ctx, registry, profile,
+		WithSnapshotSharedLister(cache.NewEmptySnapshot()),
+		WithPodNominator(q),
+	)
+	if err != nil {
+		t.Fatalf("failed to create framework: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// Pre-populate an old nomination on node1; RunNominationExtensionsAddNominatedPod
+	// should clear node1 (invoking RemoveNominatedPod) before recording node2.
+	testPodInfo, err := framework.NewPodInfo(testPod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.AddNominatedPod(logger, testPodInfo, &fwk.NominatingInfo{NominatingMode: fwk.ModeOverride, NominatedNodeName: "node1"})
+
+	f.RunNominationExtensionsAddNominatedPod(ctx, state, testPod, "node2", []*v1.Pod{victim})
+	wantEvents := []string{
+		"nom-a:remove:preemptor",
+		"nom-b:remove:preemptor",
+		"nom-a:add:preemptor:node2:1",
+		"nom-b:add:preemptor:node2:1",
+	}
+	if diff := cmp.Diff(wantEvents, events); diff != "" {
+		t.Fatalf("unexpected events after RunNominationExtensionsAddNominatedPod (-want, +got):\n%s", diff)
+	}
+	events = nil
+
+	// Subsequent FailureHandler-style AddNominatedPod for node2 must not trigger RemoveNominatedPod.
+	q.AddNominatedPod(logger, testPodInfo, &fwk.NominatingInfo{NominatingMode: fwk.ModeOverride, NominatedNodeName: "node2"})
+	if len(events) != 0 {
+		t.Fatalf("unexpected events when recording new nomination in PodNominator: %v", events)
+	}
+
+	// Clearing nomination from PodNominator automatically calls RemoveNominatedPod on all NominationExtensions plugins.
+	q.DeleteNominatedPodIfExists(testPod)
+	wantEvents = []string{
+		"nom-a:remove:preemptor",
+		"nom-b:remove:preemptor",
+	}
+	if diff := cmp.Diff(wantEvents, events); diff != "" {
+		t.Fatalf("unexpected events after DeleteNominatedPodIfExists (-want, +got):\n%s", diff)
+	}
+	events = nil
+
+	// Check PodEligibleToPreempt short-circuits on the first false return.
+	plA.eligible = false
+	eligible, reason := f.RunNominationExtensionsPodEligibleToPreempt(ctx, testPod, "node2")
+	if eligible || reason != "nom-a ineligible" {
+		t.Fatalf("expected (false, \"nom-a ineligible\"), got (%v, %q)", eligible, reason)
+	}
+	wantEvents = []string{
+		"nom-a:eligible:preemptor:node2",
+	}
+	if diff := cmp.Diff(wantEvents, events); diff != "" {
+		t.Fatalf("unexpected events after short-circuited PodEligibleToPreempt (-want, +got):\n%s", diff)
+	}
+}

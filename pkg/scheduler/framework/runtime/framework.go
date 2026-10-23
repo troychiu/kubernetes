@@ -63,6 +63,7 @@ type frameworkImpl struct {
 	scorePluginWeight         map[string]int
 	preEnqueuePlugins         []fwk.PreEnqueuePlugin
 	enqueueExtensions         []fwk.EnqueueExtensions
+	nominationExtensions      []fwk.NominationExtensions
 	queueSortPlugins          []fwk.QueueSortPlugin
 	preFilterPlugins          []fwk.PreFilterPlugin
 	filterPlugins             []fwk.FilterPlugin
@@ -467,7 +468,11 @@ func NewFramework(ctx context.Context, r Registry, profile *config.KubeScheduler
 		f.pluginsMap[name] = p
 
 		f.fillEnqueueExtensions(p)
+		f.fillNominationExtensions(p)
 	}
+	sort.Slice(f.nominationExtensions, func(i, j int) bool {
+		return f.nominationExtensions[i].Name() < f.nominationExtensions[j].Name()
+	})
 
 	// initialize plugins per individual extension points
 	for _, e := range f.getExtensionPoints(profile.Plugins) {
@@ -536,6 +541,7 @@ func NewFramework(ctx context.Context, r Registry, profile *config.KubeScheduler
 	// Logs Enabled Plugins at each extension point, taking default plugins, given config, and multipoint into consideration
 	logger.V(2).Info("the scheduler starts to work with those plugins", "Plugins", *f.ListPlugins())
 	f.setInstrumentedPlugins()
+	f.registerNominationRemovalHandler()
 	return f, nil
 }
 
@@ -579,12 +585,32 @@ func (f *frameworkImpl) setInstrumentedPlugins() {
 	}
 }
 
+type nominationRemovalRegistrar interface {
+	AddNominationRemovalHandler(profileName string, handler func(ctx context.Context, pod *v1.Pod))
+}
+
+func (f *frameworkImpl) registerNominationRemovalHandler() {
+	if len(f.nominationExtensions) == 0 || f.PodNominator == nil {
+		return
+	}
+	if r, ok := f.PodNominator.(nominationRemovalRegistrar); ok {
+		r.AddNominationRemovalHandler(f.profileName, f.RunNominationExtensionsRemoveNominatedPod)
+	}
+}
+
 func (f *frameworkImpl) SetPodNominator(n fwk.PodNominator) {
 	f.PodNominator = n
+	f.registerNominationRemovalHandler()
 }
 
 func (f *frameworkImpl) SetPodActivator(a fwk.PodActivator) {
 	f.PodActivator = a
+}
+
+func (f *frameworkImpl) Activate(logger klog.Logger, pods map[string]*v1.Pod) {
+	if f.PodActivator != nil {
+		f.PodActivator.Activate(logger, pods)
+	}
 }
 
 func (f *frameworkImpl) SetAPICacher(c fwk.APICacher) {
@@ -783,6 +809,12 @@ func (f *frameworkImpl) fillEnqueueExtensions(p fwk.Plugin) {
 	}
 
 	f.enqueueExtensions = append(f.enqueueExtensions, ext)
+}
+
+func (f *frameworkImpl) fillNominationExtensions(p fwk.Plugin) {
+	if ext, ok := p.(fwk.NominationExtensions); ok {
+		f.nominationExtensions = append(f.nominationExtensions, ext)
+	}
 }
 
 // defaultEnqueueExtension is used when a plugin does not implement EnqueueExtensions interface.
@@ -2111,6 +2143,40 @@ func (f *frameworkImpl) runReservePluginUnreserve(ctx context.Context, pl fwk.Re
 	startTime := time.Now()
 	pl.Unreserve(ctx, state, pod, nodeName)
 	f.metricsRecorder.ObservePluginDurationAsync(metrics.Unreserve, pl.Name(), fwk.Success.String(), metrics.SinceInSeconds(startTime))
+}
+
+// RunNominationExtensionsAddNominatedPod calls the AddNominatedPod interface
+// for the set of configured NominationExtensions plugins.
+func (f *frameworkImpl) RunNominationExtensionsAddNominatedPod(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string, victims []*v1.Pod) {
+	if f.PodNominator != nil {
+		// Clear any existing nomination for this pod before recording the new nomination
+		// so that a subsequent PodNominator.AddNominatedPod call in FailureHandler does
+		// not treat this as a replacement and clear the newly added nomination.
+		f.PodNominator.DeleteNominatedPodIfExists(pod)
+	}
+	for _, pl := range f.nominationExtensions {
+		pl.AddNominatedPod(ctx, state, pod, nodeName, victims)
+	}
+}
+
+// RunNominationExtensionsRemoveNominatedPod calls the RemoveNominatedPod interface
+// for the set of configured NominationExtensions plugins.
+func (f *frameworkImpl) RunNominationExtensionsRemoveNominatedPod(ctx context.Context, pod *v1.Pod) {
+	for _, pl := range f.nominationExtensions {
+		pl.RemoveNominatedPod(ctx, pod)
+	}
+}
+
+// RunNominationExtensionsPodEligibleToPreempt calls the PodEligibleToPreempt interface
+// for the set of configured NominationExtensions plugins. It returns false and the
+// reason from the first plugin that reports the pod is not eligible to preempt.
+func (f *frameworkImpl) RunNominationExtensionsPodEligibleToPreempt(ctx context.Context, pod *v1.Pod, nodeName string) (bool, string) {
+	for _, pl := range f.nominationExtensions {
+		if eligible, reason := pl.PodEligibleToPreempt(ctx, pod, nodeName); !eligible {
+			return false, reason
+		}
+	}
+	return true, ""
 }
 
 // RunPermitPlugins runs the set of configured Permit plugins. If any of these
