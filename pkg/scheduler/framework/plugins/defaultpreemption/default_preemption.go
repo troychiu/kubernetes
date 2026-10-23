@@ -195,10 +195,19 @@ func (pl *DefaultPreemption) PreEnqueue(ctx context.Context, p *v1.Pod) *fwk.Sta
 // failed by this plugin schedulable.
 func (pl *DefaultPreemption) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
 	if pl.fts.EnableAsyncPreemption {
-		return []fwk.ClusterEventWithHint{
+		events := []fwk.ClusterEventWithHint{
 			// We need to register the event to tell the scheduling queue that the pod could be un-gated after some Pods' deletion.
 			{Event: fwk.ClusterEvent{Resource: fwk.AssignedPod, ActionType: fwk.Delete}, QueueingHintFn: pl.isPodSchedulableAfterAssignedPodDeletion},
-		}, nil
+		}
+		if pl.fts.EnableDRAPreemption {
+			// A pod gated by PreEnqueue while async DRA preemption is in flight must also be
+			// un-gated when the victim's ResourceClaim is deallocated or deleted.
+			events = append(events, fwk.ClusterEventWithHint{
+				Event:          fwk.ClusterEvent{Resource: fwk.ResourceClaim, ActionType: fwk.Update | fwk.Delete},
+				QueueingHintFn: pl.isPodSchedulableAfterAssignedPodDeletion,
+			})
+		}
+		return events, nil
 	}
 
 	// When the async preemption is disabled, PreEnqueue always returns nil, and hence pods never get rejected by this plugin.

@@ -53,6 +53,7 @@ type DefaultDRAManager struct {
 	resourceSliceLister   *resourceSliceLister
 	deviceClassLister     *deviceClassLister
 	extendedResourceCache *extendedresourcecache.ExtendedResourceCache
+	preemptionTracker     *preemptionTracker
 }
 
 func NewDRAManager(ctx context.Context, claimsCache *assumecache.AssumeCache, resourceSliceTracker *resourceslicetracker.Tracker, informerFactory informers.SharedInformerFactory) *DefaultDRAManager {
@@ -66,6 +67,7 @@ func NewDRAManager(ctx context.Context, claimsCache *assumecache.AssumeCache, re
 		},
 		resourceSliceLister: &resourceSliceLister{tracker: resourceSliceTracker},
 		deviceClassLister:   &deviceClassLister{classLister: informerFactory.Resource().V1().DeviceClasses().Lister()},
+		preemptionTracker:   newPreemptionTracker(),
 	}
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.DRAExtendedResource) {

@@ -6818,3 +6818,147 @@ func TestPreFilterExtensions(t *testing.T) {
 		assert.Contains(tCtx, rootData.nodeAllocations, nodeName)
 	})
 }
+
+func TestNominationExtensions(t *testing.T) {
+	tCtx := ktesting.Init(t)
+
+	victimPodName := "victim-pod"
+	victimPodUID := types.UID("victim-uid")
+	victimClaimName := "victim-claim"
+	victimPod := st.MakePod().Name(victimPodName).Namespace(namespace).
+		UID(string(victimPodUID)).
+		Node(nodeName).
+		PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimName: &victimClaimName}).
+		Priority(10).Obj()
+	victimClaim := st.FromResourceClaim(claim).
+		Name(victimClaimName).
+		OwnerReference(victimPodName, string(victimPodUID), podKind).
+		Allocation(allocationResult).
+		ReservedForPod(victimPodName, victimPodUID).
+		Obj()
+
+	preemptorPod := (&st.PodWrapper{Pod: *podWithClaimName.DeepCopy()}).Priority(100).Obj()
+	preemptorClaim := pendingClaim.DeepCopy()
+
+	lowPrioClaimName := "low-prio-claim"
+	lowPrioPod := st.MakePod().Name("low-prio").Namespace(namespace).UID("low-prio-uid").
+		PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimName: &lowPrioClaimName}).
+		Priority(50).Obj()
+	lowPrioClaim := st.FromResourceClaim(claim).
+		Name(lowPrioClaimName).
+		OwnerReference(lowPrioPod.Name, string(lowPrioPod.UID), podKind).
+		Obj()
+
+	highPrioPod := st.MakePod().Name("high-prio").Namespace(namespace).UID("high-prio-uid").
+		PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimName: &lowPrioClaimName}).
+		Priority(200).Obj()
+
+	baseFeats := func(enablePreemption bool) feature.Features {
+		return feature.Features{
+			EnableDRAPreemption:                enablePreemption,
+			EnableDRASchedulerFilterTimeout:    true,
+			EnableDRADeviceBindingConditions:   true,
+			EnableDRAResourceClaimDeviceStatus: true,
+		}
+	}
+
+	tCtx.Run("settling-window-and-eligibility", func(tCtx ktesting.TContext) {
+		feats := baseFeats(true)
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{preemptorClaim, lowPrioClaim, victimClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{workerNodeSlice, victimPod, preemptorPod, lowPrioPod}, feats, false, nil)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victimPod)
+
+		// 1. Preemptor runs PreFilter, clones state, removes victimPod, runs Filter, and is nominated via AddNominatedPod.
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, preemptorPod, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		simState := testCtx.state.Clone()
+		victimPodInfo, err := framework.NewPodInfo(victimPod)
+		require.NoError(tCtx, err)
+		require.True(tCtx, testCtx.p.RemovePod(tCtx, simState, preemptorPod, victimPodInfo, testCtx.nodeInfos[0]).IsSuccess())
+		require.True(tCtx, testCtx.p.Filter(tCtx, simState, preemptorPod, testCtx.nodeInfos[0]).IsSuccess())
+
+		testCtx.p.AddNominatedPod(tCtx, testCtx.state, preemptorPod, nodeName, []*v1.Pod{victimPod})
+		preemptorWithNom := preemptorPod.DeepCopy()
+		preemptorWithNom.Status.NominatedNodeName = nodeName
+
+		// 2. While victimClaim is still allocated, neither preemptor nor lowPrioPod nominated on nodeName
+		// is eligible to preempt again, whereas highPrioPod (priority 200 > 100) is eligible to preempt.
+		eligible, msg := testCtx.p.PodEligibleToPreempt(tCtx, preemptorWithNom, nodeName)
+		assert.False(tCtx, eligible)
+		assert.NotEmpty(tCtx, msg)
+
+		eligible, msg = testCtx.p.PodEligibleToPreempt(tCtx, lowPrioPod, nodeName)
+		assert.False(tCtx, eligible)
+		assert.NotEmpty(tCtx, msg)
+
+		eligible, _ = testCtx.p.PodEligibleToPreempt(tCtx, highPrioPod, nodeName)
+		assert.True(tCtx, eligible)
+
+		// 3. Simulate victimClaim deallocation in cache (t3 -> t4 window).
+		storedVictimClaim, err := testCtx.draManager.ResourceClaims().Get(namespace, victimClaim.Name)
+		require.NoError(tCtx, err)
+		deallocatedVictimClaim := storedVictimClaim.DeepCopy()
+		deallocatedVictimClaim.Status.Allocation = nil
+		deallocatedVictimClaim.Status.ReservedFor = nil
+		require.NoError(tCtx, testCtx.draManager.ResourceClaims().AssumeClaimAfterAPICall(deallocatedVictimClaim))
+
+		// Queueing hint on victimClaim deallocation wakes preemptor and highPrioPod, but skips lowPrioPod.
+		hint, err := testCtx.p.isSchedulableAfterClaimChange(tCtx.Logger(), lowPrioPod, storedVictimClaim, deallocatedVictimClaim)
+		require.NoError(tCtx, err)
+		assert.Equal(tCtx, fwk.QueueSkip, hint)
+
+		hint, err = testCtx.p.isSchedulableAfterClaimChange(tCtx.Logger(), preemptorWithNom, storedVictimClaim, deallocatedVictimClaim)
+		require.NoError(tCtx, err)
+		assert.Equal(tCtx, fwk.Queue, hint)
+
+		hint, err = testCtx.p.isSchedulableAfterClaimChange(tCtx.Logger(), highPrioPod, storedVictimClaim, deallocatedVictimClaim)
+		require.NoError(tCtx, err)
+		assert.Equal(tCtx, fwk.Queue, hint)
+
+		// Once victimClaim is deallocated, preemptor is eligible to preempt again if needed.
+		eligible, _ = testCtx.p.PodEligibleToPreempt(tCtx, preemptorWithNom, nodeName)
+		assert.True(tCtx, eligible)
+
+		// 4. Even if lowPrioPod runs a scheduling cycle after victimClaim is deallocated, Pass 1 (AddPod for nominated preemptor)
+		// accounts for preemptor's cached allocation and rejects lowPrioPod on nodeName!
+		lowState := framework.NewCycleState()
+		_, status = testCtx.p.PreFilter(tCtx, lowState, lowPrioPod, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		pass1LowState := lowState.Clone()
+		preemptorPodInfo, err := framework.NewPodInfo(preemptorWithNom)
+		require.NoError(tCtx, err)
+		require.True(tCtx, testCtx.p.AddPod(tCtx, pass1LowState, lowPrioPod, preemptorPodInfo, testCtx.nodeInfos[0]).IsSuccess())
+		status = testCtx.p.Filter(tCtx, pass1LowState, lowPrioPod, testCtx.nodeInfos[0])
+		assert.Equal(tCtx, fwk.Unschedulable, status.Code())
+
+		// 5. Preemptor runs its scheduling cycle (evaluateNominatedNode fast-path) and succeeds in Filter + Reserve.
+		preemptorState := framework.NewCycleState()
+		_, status = testCtx.p.PreFilter(tCtx, preemptorState, preemptorWithNom, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+		require.True(tCtx, testCtx.p.Filter(tCtx, preemptorState, preemptorWithNom, testCtx.nodeInfos[0]).IsSuccess())
+		require.True(tCtx, testCtx.p.Reserve(tCtx, preemptorState, preemptorWithNom, nodeName).IsSuccess())
+
+		// Reserve clears preemptor's nomination tracking.
+		assert.Nil(tCtx, testCtx.p.getPreemptionTracker().getNominatedPodAllocations(preemptorPod.UID, nodeName))
+	})
+
+	tCtx.Run("unreserve-deallocates-preempted-prebind-claim", func(tCtx ktesting.TContext) {
+		feats := baseFeats(true)
+		terminatingVictim := victimPod.DeepCopy()
+		now := metav1.Now()
+		terminatingVictim.DeletionTimestamp = &now
+
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{victimClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{workerNodeSlice, terminatingVictim}, feats, false, nil)
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, terminatingVictim, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		testCtx.p.Unreserve(tCtx, testCtx.state, terminatingVictim, nodeName)
+
+		updated, err := testCtx.client.ResourceV1().ResourceClaims(namespace).Get(tCtx, victimClaim.Name, metav1.GetOptions{})
+		require.NoError(tCtx, err)
+		assert.Nil(tCtx, updated.Status.Allocation)
+		assert.Empty(tCtx, updated.Status.ReservedFor)
+	})
+}

@@ -18,12 +18,15 @@ package dynamicresources
 
 import (
 	"context"
+	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	draapi "k8s.io/dynamic-resource-allocation/api"
 	"k8s.io/dynamic-resource-allocation/resourceclaim"
 	"k8s.io/dynamic-resource-allocation/structured"
@@ -33,6 +36,237 @@ import (
 )
 
 var _ fwk.PreFilterExtensions = &DynamicResources{}
+
+type nominatedPodInfo struct {
+	pod               *v1.Pod
+	nodeName          string
+	allocationResults []resourceapi.AllocationResult
+	victimClaims      sets.Set[types.UID]
+}
+
+// preemptionTracker caches per-nominated-pod simulated DRA allocations and tracks
+// which ResourceClaims belong to victims of active nominations on each node.
+// This avoids re-running the DRA allocator in Pass 1 of RunFilterPluginsWithNominatedPods
+// and prevents lower-priority pods from stealing freed devices during the asynchronous
+// victim termination and claim deallocation window.
+type preemptionTracker struct {
+	mu                 sync.RWMutex
+	nominatedPods      map[types.UID]nominatedPodInfo
+	podsByNode         map[string]sets.Set[types.UID]
+	victimClaimsByNode map[string]sets.Set[types.UID]
+	nodesByVictimClaim map[types.UID]string
+	claimNamesByUID    map[types.UID]types.NamespacedName
+}
+
+func newPreemptionTracker() *preemptionTracker {
+	return &preemptionTracker{
+		nominatedPods:      make(map[types.UID]nominatedPodInfo),
+		podsByNode:         make(map[string]sets.Set[types.UID]),
+		victimClaimsByNode: make(map[string]sets.Set[types.UID]),
+		nodesByVictimClaim: make(map[types.UID]string),
+		claimNamesByUID:    make(map[types.UID]types.NamespacedName),
+	}
+}
+
+func (t *preemptionTracker) addNominatedPod(pod *v1.Pod, nodeName string, allocs []resourceapi.AllocationResult, victimClaims map[types.UID]types.NamespacedName) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if prev, ok := t.nominatedPods[pod.UID]; ok && prev.nodeName != nodeName {
+		if nodePods, exists := t.podsByNode[prev.nodeName]; exists {
+			nodePods.Delete(pod.UID)
+			if len(nodePods) == 0 {
+				delete(t.podsByNode, prev.nodeName)
+				t.clearNodeVictimClaimsLocked(prev.nodeName)
+			}
+		}
+	}
+
+	var copiedAllocs []resourceapi.AllocationResult
+	if len(allocs) > 0 {
+		copiedAllocs = make([]resourceapi.AllocationResult, len(allocs))
+		for i := range allocs {
+			copiedAllocs[i] = *allocs[i].DeepCopy()
+		}
+	}
+
+	var copiedClaims sets.Set[types.UID]
+	if len(victimClaims) > 0 {
+		copiedClaims = sets.New[types.UID]()
+		for claimUID := range victimClaims {
+			copiedClaims.Insert(claimUID)
+		}
+	}
+
+	t.nominatedPods[pod.UID] = nominatedPodInfo{
+		pod:               pod,
+		nodeName:          nodeName,
+		allocationResults: copiedAllocs,
+		victimClaims:      copiedClaims,
+	}
+	if t.podsByNode[nodeName] == nil {
+		t.podsByNode[nodeName] = sets.New[types.UID]()
+	}
+	t.podsByNode[nodeName].Insert(pod.UID)
+
+	if len(victimClaims) > 0 {
+		if t.victimClaimsByNode[nodeName] == nil {
+			t.victimClaimsByNode[nodeName] = sets.New[types.UID]()
+		}
+		for claimUID, nn := range victimClaims {
+			t.victimClaimsByNode[nodeName].Insert(claimUID)
+			t.nodesByVictimClaim[claimUID] = nodeName
+			t.claimNamesByUID[claimUID] = nn
+		}
+	}
+}
+
+func (t *preemptionTracker) removeNominatedPod(podUID types.UID) (info nominatedPodInfo, remainingPodsOnNode int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	info, ok := t.nominatedPods[podUID]
+	if !ok {
+		return nominatedPodInfo{}, 0
+	}
+	delete(t.nominatedPods, podUID)
+	nodeName := info.nodeName
+	if nodePods, exists := t.podsByNode[nodeName]; exists {
+		nodePods.Delete(podUID)
+		remainingPodsOnNode = len(nodePods)
+		if remainingPodsOnNode == 0 {
+			delete(t.podsByNode, nodeName)
+		}
+	}
+	return info, remainingPodsOnNode
+}
+
+func (t *preemptionTracker) clearNodeVictimClaims(nodeName string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.clearNodeVictimClaimsLocked(nodeName)
+}
+
+func (t *preemptionTracker) clearNodeVictimClaimsLocked(nodeName string) {
+	for claimUID := range t.victimClaimsByNode[nodeName] {
+		delete(t.nodesByVictimClaim, claimUID)
+		delete(t.claimNamesByUID, claimUID)
+	}
+	delete(t.victimClaimsByNode, nodeName)
+}
+
+func (t *preemptionTracker) getNominatedPodInfo(podUID types.UID) (nominatedPodInfo, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	info, ok := t.nominatedPods[podUID]
+	return info, ok
+}
+
+func (t *preemptionTracker) getNominatedPodAllocations(podUID types.UID, nodeName string) []resourceapi.AllocationResult {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	info, ok := t.nominatedPods[podUID]
+	if !ok || info.nodeName != nodeName {
+		return nil
+	}
+	return info.allocationResults
+}
+
+func (t *preemptionTracker) getNominatedPodsForNode(nodeName string) []nominatedPodInfo {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	podUIDs := t.podsByNode[nodeName]
+	if len(podUIDs) == 0 {
+		return nil
+	}
+	res := make([]nominatedPodInfo, 0, len(podUIDs))
+	for uid := range podUIDs {
+		if info, ok := t.nominatedPods[uid]; ok {
+			res = append(res, info)
+		}
+	}
+	return res
+}
+
+func (t *preemptionTracker) getVictimClaimsForNode(nodeName string) sets.Set[types.UID] {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	claims := t.victimClaimsByNode[nodeName]
+	if len(claims) == 0 {
+		return nil
+	}
+	return claims.Clone()
+}
+
+func (t *preemptionTracker) getNodeForVictimClaim(claimUID types.UID) (string, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	nodeName, ok := t.nodesByVictimClaim[claimUID]
+	return nodeName, ok
+}
+
+func (t *preemptionTracker) isTrackedVictimClaim(claimUID types.UID) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	_, ok := t.nodesByVictimClaim[claimUID]
+	return ok
+}
+
+func (t *preemptionTracker) getVictimClaimNamespacedName(claimUID types.UID) (types.NamespacedName, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	nn, ok := t.claimNamesByUID[claimUID]
+	return nn, ok
+}
+
+func (t *preemptionTracker) removeVictimClaims(nodeName string, claimUIDs ...types.UID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	nodeClaims := t.victimClaimsByNode[nodeName]
+	for _, uid := range claimUIDs {
+		delete(t.nodesByVictimClaim, uid)
+		delete(t.claimNamesByUID, uid)
+		if nodeClaims != nil {
+			nodeClaims.Delete(uid)
+		}
+	}
+	if nodeClaims != nil && len(nodeClaims) == 0 {
+		delete(t.victimClaimsByNode, nodeName)
+	}
+}
+
+func (pl *DynamicResources) getPreemptionTracker() *preemptionTracker {
+	pl.preemptionTrackerOnce.Do(func() {
+		if pl.preemptionTracker == nil {
+			if mgr, ok := pl.draManager.(*DefaultDRAManager); ok && mgr.preemptionTracker != nil {
+				pl.preemptionTracker = mgr.preemptionTracker
+			} else {
+				pl.preemptionTracker = newPreemptionTracker()
+			}
+		}
+	})
+	return pl.preemptionTracker
+}
+
+func (pl *DynamicResources) clearNominatedPodOnReserve(podUID types.UID) {
+	tracker := pl.getPreemptionTracker()
+	info, remaining := tracker.removeNominatedPod(podUID)
+	if info.nodeName != "" {
+		if remaining == 0 {
+			tracker.clearNodeVictimClaims(info.nodeName)
+		} else if len(info.victimClaims) > 0 {
+			pl.pruneDeallocatedVictimClaims(info.nodeName)
+		}
+	}
+}
 
 // PreFilterExtensions returns prefilter extensions, pod add and remove.
 func (pl *DynamicResources) PreFilterExtensions() fwk.PreFilterExtensions {
@@ -149,6 +383,49 @@ func (pl *DynamicResources) AddPod(ctx context.Context, cs fwk.CycleState, podTo
 	}
 
 	nodeName := nodeInfo.Node().Name
+	if !state.everRemovedUsers.Has(pod.UID) {
+		pl.foreachVictimResourceClaim(pod, func(claim *resourceapi.ResourceClaim, alloc *resourceapi.AllocationResult) {
+			if !state.removedVictimClaims.Has(claim.UID) || !isAllocationLocalToNode(alloc, state.slices, nodeName) {
+				return
+			}
+			addAllocationToState(alloc, state, pl.fts.EnableDRAConsumableCapacity)
+			state.removedVictimClaims.Delete(claim.UID)
+			state.allocatorDirty = true
+		})
+		if info, ok := pl.getPreemptionTracker().getNominatedPodInfo(pod.UID); ok && info.nodeName == nodeName {
+			for claimUID := range info.victimClaims {
+				if state.removedVictimClaims.Has(claimUID) {
+					continue
+				}
+				claim, alloc := pl.getVictimClaimAndAllocation(claimUID)
+				if claim == nil || alloc == nil || !isAllocationLocalToNode(alloc, state.slices, nodeName) {
+					continue
+				}
+				reprieved := false
+				for _, ref := range claim.Status.ReservedFor {
+					if ref.Resource == "pods" && state.everRemovedUsers.Has(ref.UID) && !state.removedClaimUsers[claimUID].Has(ref.UID) {
+						reprieved = true
+						break
+					}
+				}
+				if reprieved {
+					continue
+				}
+				removeAllocationFromState(alloc, state, pl.fts.EnableDRAConsumableCapacity)
+				if state.removedVictimClaims == nil {
+					state.removedVictimClaims = sets.New[types.UID]()
+				}
+				state.removedVictimClaims.Insert(claimUID)
+				state.allocatorDirty = true
+			}
+			for i := range info.allocationResults {
+				addAllocationToState(&info.allocationResults[i], state, pl.fts.EnableDRAConsumableCapacity)
+				state.allocatorDirty = true
+			}
+		}
+		return nil
+	}
+
 	pl.foreachVictimResourceClaim(pod, func(claim *resourceapi.ResourceClaim, alloc *resourceapi.AllocationResult) {
 		if !isAllocationLocalToNode(alloc, state.slices, nodeName) {
 			return
@@ -552,4 +829,293 @@ func (pl *DynamicResources) validateAllocationResults(
 	}
 
 	return true
+}
+
+// AddNominatedPod caches the simulated DRA allocations for a newly nominated pod
+// and records its victims' node-local ResourceClaims for settling-window protection.
+func (pl *DynamicResources) AddNominatedPod(ctx context.Context, cs fwk.CycleState, pod *v1.Pod, nodeName string, victims []*v1.Pod) {
+	if !pl.fts.EnableDRAPreemption || pod == nil || nodeName == "" {
+		return
+	}
+	pl.pruneDeallocatedVictimClaims(nodeName)
+
+	var state *stateData
+	if cs != nil {
+		state, _ = getStateData(cs)
+	}
+
+	var allocs []resourceapi.AllocationResult
+	if state != nil {
+		root := state.root()
+		root.mutex.Lock()
+		if na, ok := root.preemptionNodeAllocations[nodeName]; ok {
+			allocs = na.allocationResults
+		} else if na, ok := root.nodeAllocations[nodeName]; ok {
+			allocs = na.allocationResults
+		}
+		root.mutex.Unlock()
+	}
+
+	var slices []*resourceapi.ResourceSlice
+	if state != nil && len(state.slices) > 0 {
+		slices = state.slices
+	} else if len(victims) > 0 && pl.draManager != nil && pl.draManager.ResourceSlices() != nil {
+		slices, _ = pl.draManager.ResourceSlices().ListWithDeviceTaintRules()
+	}
+
+	victimUIDs := sets.New[types.UID]()
+	for _, v := range victims {
+		if v != nil {
+			victimUIDs.Insert(v.UID)
+		}
+	}
+
+	victimClaims := make(map[types.UID]types.NamespacedName)
+	for _, victim := range victims {
+		if victim == nil || (victim.Spec.SchedulingGroup != nil && victim.Spec.SchedulingGroup.PodGroupName != nil) {
+			continue
+		}
+		pl.foreachVictimResourceClaim(victim, func(claim *resourceapi.ResourceClaim, alloc *resourceapi.AllocationResult) {
+			if len(slices) > 0 && !isAllocationLocalToNode(alloc, slices, nodeName) {
+				return
+			}
+			if !pl.allConsumersRemovedOrTerminating(claim, victimUIDs, nil, nil) {
+				return
+			}
+			victimClaims[claim.UID] = types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name}
+		})
+	}
+
+	if len(pod.Spec.ResourceClaims) == 0 && len(allocs) == 0 && len(victimClaims) == 0 {
+		pl.clearNominatedPodOnReserve(pod.UID)
+		return
+	}
+
+	pl.getPreemptionTracker().addNominatedPod(pod, nodeName, allocs, victimClaims)
+}
+
+// RemoveNominatedPod clears cached DRA preemption state for pod when its nomination is cleared.
+func (pl *DynamicResources) RemoveNominatedPod(ctx context.Context, pod *v1.Pod) {
+	if !pl.fts.EnableDRAPreemption || pod == nil {
+		return
+	}
+	tracker := pl.getPreemptionTracker()
+	info, remaining := tracker.removeNominatedPod(pod.UID)
+	if info.nodeName != "" {
+		pl.pruneDeallocatedVictimClaims(info.nodeName)
+		if remaining == 0 && !pl.hasRemainingAllocatedVictimClaims(info.nodeName, "") {
+			tracker.clearNodeVictimClaims(info.nodeName)
+		}
+	}
+}
+
+// PodEligibleToPreempt prevents a pod from preempting again while any victim ResourceClaim
+// on its nominated node is still allocated or in-flight.
+func (pl *DynamicResources) PodEligibleToPreempt(ctx context.Context, pod *v1.Pod, nominatedNodeName string) (bool, string) {
+	if !pl.fts.EnableDRAPreemption || pod == nil {
+		return true, ""
+	}
+	tracker := pl.getPreemptionTracker()
+
+	if info, ok := tracker.getNominatedPodInfo(pod.UID); ok && len(info.victimClaims) > 0 {
+		if pl.hasRemainingAllocatedClaims(info.victimClaims, "") {
+			return false, "waiting for preempted ResourceClaims to be deallocated on nominated node"
+		}
+		tracker.removeVictimClaims(info.nodeName, info.victimClaims.UnsortedList()...)
+		return true, ""
+	}
+
+	if nominatedNodeName != "" {
+		nodeClaims := tracker.getVictimClaimsForNode(nominatedNodeName)
+		if len(nodeClaims) > 0 {
+			podPriority := corev1helpers.PodPriority(pod)
+			anyAllocated := false
+			for claimUID := range nodeClaims {
+				if pl.getVictimClaimAllocation("", "", claimUID) == nil {
+					continue
+				}
+				anyAllocated = true
+				if pl.isClaimReservedForHigherOrEqualNominatedPod(claimUID, pod.UID, podPriority) {
+					return false, "waiting for preempted ResourceClaims to be deallocated on nominated node"
+				}
+			}
+			if !anyAllocated {
+				tracker.clearNodeVictimClaims(nominatedNodeName)
+			}
+		}
+	}
+
+	return true, ""
+}
+
+func (pl *DynamicResources) getVictimClaimAndAllocation(claimUID types.UID) (*resourceapi.ResourceClaim, *resourceapi.AllocationResult) {
+	if pl.draManager == nil || pl.draManager.ResourceClaims() == nil {
+		return nil, nil
+	}
+	if nn, ok := pl.getPreemptionTracker().getVictimClaimNamespacedName(claimUID); ok && nn.Namespace != "" && nn.Name != "" {
+		claim, err := pl.draManager.ResourceClaims().Get(nn.Namespace, nn.Name)
+		if err != nil || claim == nil || claim.UID != claimUID {
+			return nil, nil
+		}
+		if claim.Status.Allocation != nil {
+			return claim, claim.Status.Allocation
+		}
+		if alloc := pl.draManager.ResourceClaims().GetPendingAllocation(claimUID); alloc != nil {
+			return claim, alloc
+		}
+		return claim, nil
+	}
+	claims, _ := pl.draManager.ResourceClaims().List()
+	for _, claim := range claims {
+		if claim.UID != claimUID {
+			continue
+		}
+		if claim.Status.Allocation != nil {
+			return claim, claim.Status.Allocation
+		}
+		if alloc := pl.draManager.ResourceClaims().GetPendingAllocation(claimUID); alloc != nil {
+			return claim, alloc
+		}
+		return claim, nil
+	}
+	return nil, nil
+}
+
+func (pl *DynamicResources) getVictimClaimAllocation(namespace, name string, claimUID types.UID) *resourceapi.AllocationResult {
+	if pl.draManager == nil || pl.draManager.ResourceClaims() == nil {
+		return nil
+	}
+	if namespace != "" && name != "" {
+		claim, err := pl.draManager.ResourceClaims().Get(namespace, name)
+		if err != nil || claim == nil || claim.UID != claimUID {
+			return nil
+		}
+		if claim.Status.Allocation != nil {
+			return claim.Status.Allocation
+		}
+		return pl.draManager.ResourceClaims().GetPendingAllocation(claimUID)
+	}
+	_, alloc := pl.getVictimClaimAndAllocation(claimUID)
+	return alloc
+}
+
+func (pl *DynamicResources) hasRemainingAllocatedClaims(claimUIDs sets.Set[types.UID], excludeClaimUID types.UID) bool {
+	for claimUID := range claimUIDs {
+		if claimUID == excludeClaimUID {
+			continue
+		}
+		if pl.getVictimClaimAllocation("", "", claimUID) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (pl *DynamicResources) hasRemainingAllocatedVictimClaims(nodeName string, excludeClaimUID types.UID) bool {
+	return pl.hasRemainingAllocatedClaims(pl.getPreemptionTracker().getVictimClaimsForNode(nodeName), excludeClaimUID)
+}
+
+func (pl *DynamicResources) pruneDeallocatedVictimClaims(nodeName string) {
+	tracker := pl.getPreemptionTracker()
+	var deallocated []types.UID
+	for claimUID := range tracker.getVictimClaimsForNode(nodeName) {
+		if pl.getVictimClaimAllocation("", "", claimUID) == nil {
+			deallocated = append(deallocated, claimUID)
+		}
+	}
+	if len(deallocated) > 0 {
+		tracker.removeVictimClaims(nodeName, deallocated...)
+	}
+}
+
+func (pl *DynamicResources) shouldSkipClaimDeallocationWakeup(pod *v1.Pod, deallocatedClaim *resourceapi.ResourceClaim) bool {
+	if !pl.fts.EnableDRAPreemption || pod == nil || deallocatedClaim == nil {
+		return false
+	}
+	tracker := pl.getPreemptionTracker()
+	if info, ok := tracker.getNominatedPodInfo(pod.UID); ok && len(info.victimClaims) > 0 {
+		if pl.hasRemainingAllocatedClaims(info.victimClaims, deallocatedClaim.UID) {
+			return true
+		}
+		if info.victimClaims.Has(deallocatedClaim.UID) {
+			return false
+		}
+	}
+
+	victimNode, ok := tracker.getNodeForVictimClaim(deallocatedClaim.UID)
+	if !ok {
+		return false
+	}
+
+	nominatedForNode := tracker.getNominatedPodsForNode(victimNode)
+	if pod.Status.NominatedNodeName == victimNode {
+		if pl.hasRemainingAllocatedVictimClaims(victimNode, deallocatedClaim.UID) {
+			return true
+		}
+		return false
+	}
+
+	if pl.isClaimReservedForHigherOrEqualNominatedPod(deallocatedClaim.UID, pod.UID, corev1helpers.PodPriority(pod)) {
+		return true
+	}
+
+	if len(nominatedForNode) == 0 && !pl.hasRemainingAllocatedVictimClaims(victimNode, deallocatedClaim.UID) {
+		tracker.removeVictimClaims(victimNode, deallocatedClaim.UID)
+	}
+
+	return false
+}
+
+func (pl *DynamicResources) isClaimReservedForHigherOrEqualNominatedPod(claimUID types.UID, candidateUID types.UID, candidatePriority int32) bool {
+	tracker := pl.getPreemptionTracker()
+	victimNode, ok := tracker.getNodeForVictimClaim(claimUID)
+	if !ok {
+		return false
+	}
+	nominatedForNode := tracker.getNominatedPodsForNode(victimNode)
+	matchedSpecificOwner := false
+	for _, np := range nominatedForNode {
+		if !np.victimClaims.Has(claimUID) {
+			continue
+		}
+		matchedSpecificOwner = true
+		if np.pod != nil && np.pod.UID != candidateUID && corev1helpers.PodPriority(np.pod) >= candidatePriority {
+			return true
+		}
+	}
+	if matchedSpecificOwner {
+		return false
+	}
+	for _, np := range nominatedForNode {
+		if np.pod == nil || np.pod.UID == candidateUID {
+			continue
+		}
+		if corev1helpers.PodPriority(np.pod) >= candidatePriority {
+			return true
+		}
+	}
+	return false
+}
+
+func (pl *DynamicResources) activateUnscheduledClaimPods(ctx context.Context, deallocatedClaim *resourceapi.ResourceClaim) {
+	if pl.fh == nil || pl.fh.SharedInformerFactory() == nil || deallocatedClaim == nil {
+		return
+	}
+	pods, err := pl.fh.SharedInformerFactory().Core().V1().Pods().Lister().List(labels.Everything())
+	if err != nil {
+		return
+	}
+	toActivate := make(map[string]*v1.Pod)
+	for _, p := range pods {
+		if p.Spec.NodeName != "" || p.DeletionTimestamp != nil {
+			continue
+		}
+		hint, err := pl.isSchedulableAfterClaimChange(klog.FromContext(ctx), p, deallocatedClaim, nil)
+		if err == nil && hint == fwk.Queue {
+			toActivate[p.Namespace+"/"+p.Name] = p
+		}
+	}
+	if len(toActivate) > 0 {
+		pl.fh.Activate(klog.FromContext(ctx), toActivate)
+	}
 }
