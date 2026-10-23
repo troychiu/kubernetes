@@ -43,10 +43,25 @@ func foreachAllocatedDevice(claim *resourceapi.ResourceClaim,
 	enabledConsumableCapacity bool,
 	sharedDeviceCallback func(structured.SharedDeviceID),
 	consumedCapacityCallback func(structured.DeviceConsumedCapacity)) {
-	if claim.Status.Allocation == nil {
+	foreachAllocationResultDevice(claim.Status.Allocation, dedicatedDeviceCallback, enabledConsumableCapacity, sharedDeviceCallback, consumedCapacityCallback)
+}
+
+// foreachAllocationResultDevice invokes the provided callback for each
+// device in the allocation result which was allocated for a claim.
+//
+// Devices allocated with admin access can be shared with other
+// claims and are skipped without invoking the callback.
+//
+// foreachAllocationResultDevice does nothing if allocation is nil.
+func foreachAllocationResultDevice(allocation *resourceapi.AllocationResult,
+	dedicatedDeviceCallback func(deviceID structured.DeviceID),
+	enabledConsumableCapacity bool,
+	sharedDeviceCallback func(structured.SharedDeviceID),
+	consumedCapacityCallback func(structured.DeviceConsumedCapacity)) {
+	if allocation == nil {
 		return
 	}
-	for _, result := range claim.Status.Allocation.Devices.Results {
+	for _, result := range allocation.Devices.Results {
 		// Kubernetes 1.31 did not set this, 1.32 always does.
 		// Supporting 1.31 is not worth the additional code that
 		// would have to be written (= looking up in request) because
@@ -129,6 +144,13 @@ func (a *allocatedDevices) GetSharedDeviceIDs() (sets.Set[structured.DeviceID], 
 		result.Insert(sharedDeviceID.GetDeviceID())
 	}
 	return result, a.revision
+}
+
+func (a *allocatedDevices) GetShareIDs() (sets.Set[structured.SharedDeviceID], int64) {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+
+	return a.shareIDs.Clone(), a.revision
 }
 
 func (a *allocatedDevices) Capacities() (structured.ConsumedCapacityCollection, int64) {

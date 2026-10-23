@@ -113,6 +113,11 @@ type stateData struct {
 	// nodeAllocations caches the result of Filter for the nodes, its key is node name.
 	nodeAllocations map[string]nodeAllocation
 
+	// pass1NodeAllocations temporarily holds the Filter result from Pass 1 (with nominated pods)
+	// of RunFilterPluginsWithNominatedPods so Pass 2 (without nominated pods) can validate it
+	// before committing to nodeAllocations.
+	pass1NodeAllocations map[string]nodeAllocation
+
 	// claimHasNodeAllocatableMappedDevice stores whether a claim's allocation is mapped.
 	// A claim is mapped if it is allocated a device that models a node-allocatable
 	// resource (like cpu, memory) via the NodeAllocatableResources.Mapping field in the
@@ -120,10 +125,80 @@ type stateData struct {
 	// This map is used in the Filter phase to prevent sharing these mapped claims across pods.
 	// Populated in PreFilter and read in Filter.
 	claimHasNodeAllocatableMappedDevice map[types.UID]bool
+
+	// Fields below are used for DRA preemption simulation (RemovePod/AddPod).
+	parent                 *stateData
+	allocatedState         *structured.AllocatedState
+	sharedDeviceIDs        sets.Set[structured.SharedDeviceID]
+	slices                 []*resourceapi.ResourceSlice
+	removedClaimUsers      map[types.UID]sets.Set[types.UID]
+	everRemovedUsers       sets.Set[types.UID]
+	removedVictimClaims    sets.Set[types.UID]
+	allocatorDirty         bool
+	sawRemovePodSinceClone bool
+	isPass1Clone           bool
+}
+
+func (d *stateData) root() *stateData {
+	if d.parent != nil {
+		return d.parent
+	}
+	return d
 }
 
 func (d *stateData) Clone() fwk.StateData {
-	return d
+	if d.allocatedState == nil {
+		return d
+	}
+	root := d.root()
+	var allocatedState *structured.AllocatedState
+	if d.allocatedState != nil {
+		allocatedState = &structured.AllocatedState{
+			AllocatedDevices:         d.allocatedState.AllocatedDevices.Clone(),
+			AllocatedSharedDeviceIDs: d.allocatedState.AllocatedSharedDeviceIDs.Clone(),
+			AggregatedCapacity:       d.allocatedState.AggregatedCapacity.Clone(),
+		}
+	}
+	var sharedDeviceIDs sets.Set[structured.SharedDeviceID]
+	if d.sharedDeviceIDs != nil {
+		sharedDeviceIDs = d.sharedDeviceIDs.Clone()
+	}
+	var removedClaimUsers map[types.UID]sets.Set[types.UID]
+	if d.removedClaimUsers != nil {
+		removedClaimUsers = make(map[types.UID]sets.Set[types.UID], len(d.removedClaimUsers))
+		for claimUID, users := range d.removedClaimUsers {
+			removedClaimUsers[claimUID] = users.Clone()
+		}
+	}
+	var everRemovedUsers sets.Set[types.UID]
+	if d.everRemovedUsers != nil {
+		everRemovedUsers = d.everRemovedUsers.Clone()
+	}
+	var removedVictimClaims sets.Set[types.UID]
+	if d.removedVictimClaims != nil {
+		removedVictimClaims = d.removedVictimClaims.Clone()
+	}
+
+	return &stateData{
+		claims:                              d.claims,
+		draExtendedResource:                 d.draExtendedResource,
+		allocator:                           d.allocator,
+		unavailableClaims:                   root.unavailableClaims,
+		informationsForClaim:                d.informationsForClaim,
+		nodeAllocations:                     root.nodeAllocations,
+		pass1NodeAllocations:                root.pass1NodeAllocations,
+		claimHasNodeAllocatableMappedDevice: d.claimHasNodeAllocatableMappedDevice,
+		parent:                              root,
+		allocatedState:                      allocatedState,
+		sharedDeviceIDs:                     sharedDeviceIDs,
+		slices:                              d.slices,
+		removedClaimUsers:                   removedClaimUsers,
+		everRemovedUsers:                    everRemovedUsers,
+		removedVictimClaims:                 removedVictimClaims,
+		allocatorDirty:                      d.allocatorDirty,
+		sawRemovePodSinceClone:              false,
+		isPass1Clone:                        false,
+	}
 }
 
 // This state is persisted in the PodGroup CycleState. Because we save the
@@ -568,7 +643,9 @@ func (pl *DynamicResources) PreFilter(ctx context.Context, state fwk.CycleState,
 	// observation for the other functions. This gets updated below
 	// if we get that far.
 	s := &stateData{
-		nodeAllocations: make(map[string]nodeAllocation),
+		nodeAllocations:        make(map[string]nodeAllocation),
+		pass1NodeAllocations:   make(map[string]nodeAllocation),
+		sawRemovePodSinceClone: true,
 	}
 	state.Write(stateKey, s)
 
@@ -603,6 +680,7 @@ func (pl *DynamicResources) PreFilter(ctx context.Context, state fwk.CycleState,
 	if claims.empty() {
 		return nil, fwk.NewStatus(fwk.Skip)
 	}
+	s.claims = claims
 
 	// Counts all claims which the scheduler needs to allocate itself.
 	numClaimsToAllocate := 0
@@ -763,9 +841,14 @@ func (pl *DynamicResources) PreFilter(ctx context.Context, state fwk.CycleState,
 		// This might have to be retried in the unlikely case that some concurrent modification made
 		// the result invalid.
 		var allocatedState *structured.AllocatedState
+		var sharedDeviceIDs sets.Set[structured.SharedDeviceID]
 		err = wait.PollUntilContextTimeout(ctx, time.Microsecond, 5*time.Second, true /* immediate */, func(context.Context) (bool, error) {
 			if pl.fts.EnableDRAConsumableCapacity {
-				allocatedState, err = pl.draManager.ResourceClaims().GatherAllocatedState()
+				if ct, ok := pl.draManager.ResourceClaims().(*claimTracker); ok && pl.fts.EnableDRAPreemption {
+					allocatedState, sharedDeviceIDs, err = ct.gatherAllocatedStateWithShares()
+				} else {
+					allocatedState, err = pl.draManager.ResourceClaims().GatherAllocatedState()
+				}
 				if err != nil {
 					if errors.Is(err, errClaimTrackerConcurrentModification) {
 						logger.V(6).Info("Conflicting modification during GatherAllocatedState, trying again")
@@ -809,8 +892,12 @@ func (pl *DynamicResources) PreFilter(ctx context.Context, state fwk.CycleState,
 			return nil, statusError(logger, err)
 		}
 		s.allocator = allocator
+		if pl.isPreemptionSupported(pod, s) {
+			s.allocatedState = allocatedState
+			s.sharedDeviceIDs = sharedDeviceIDs
+			s.slices = slices
+		}
 	}
-	s.claims = claims
 	return nil, nil
 }
 
@@ -844,11 +931,6 @@ func (pl *DynamicResources) validateDeviceClass(logger klog.Logger, deviceClassN
 			return statusUnschedulable(logger, fmt.Sprintf("request %s: device class %s does not exist", requestName, deviceClassName))
 		}
 	}
-	return nil
-}
-
-// PreFilterExtensions returns prefilter extensions, pod add and remove.
-func (pl *DynamicResources) PreFilterExtensions() fwk.PreFilterExtensions {
 	return nil
 }
 
@@ -999,6 +1081,18 @@ func (pl *DynamicResources) Filter(ctx context.Context, cs fwk.CycleState, pod *
 		}
 	}
 	// Use allocator to check the node and cache the result in case that the node is picked.
+	rootState := state.root()
+	var pass1Alloc *nodeAllocation
+	if !state.isPass1Clone {
+		rootState.mutex.Lock()
+		if alloc, ok := rootState.pass1NodeAllocations[node.Name]; ok {
+			allocCopy := alloc
+			pass1Alloc = &allocCopy
+			delete(rootState.pass1NodeAllocations, node.Name)
+		}
+		rootState.mutex.Unlock()
+	}
+
 	var allocations []resourceapi.AllocationResult
 	var nodeAllocatableClaimStatus []v1.NodeAllocatableResourceClaimStatus
 	allocationsMap := make(map[types.UID]*resourceapi.AllocationResult)
@@ -1040,38 +1134,64 @@ func (pl *DynamicResources) Filter(ctx context.Context, cs fwk.CycleState, pod *
 			}
 			claimsToAllocate = append(claimsToAllocate, claim)
 		}
-		allocationResult, err := state.allocator.Allocate(allocCtx, node, claimsToAllocate)
-		switch {
-		case errors.Is(err, context.DeadlineExceeded):
-			// Timeouts are potentially transient. Return Error
-			// so the pod retries via backoff instead of sitting in the
-			// unschedulable queue waiting for a cluster event.
-			//
-			// The timeout might be caused by ResourceSlices for the node,
-			// so including the node name may help with diagnosing the failure.
-			return statusError(logger, fmt.Errorf("node %s: timed out trying to allocate devices", node.Name), "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
-		case errors.Is(err, structured.ErrFailedAllocationOnNode):
-			// Not a fatal error, allocation on other nodes may proceed.
-			// The error is only surfaced if allocation fails on all nodes.
-			return statusUnschedulable(logger, err.Error(), "pod", klog.KObj(pod), "node", klog.KObj(node))
-		case ctx.Err() != nil:
-			return statusUnschedulable(logger, fmt.Sprintf("asked by caller to stop allocating devices: %v", context.Cause(ctx)), "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
-		case err != nil:
-			// This should only fail if there is something wrong with the claim or class.
-			// Return an error to abort scheduling of it.
-			//
-			// This will cause retries. It would be slightly nicer to mark it as unschedulable
-			// *and* abort scheduling. Then only cluster event for updating the claim or class
-			// with the broken CEL expression would trigger rescheduling.
-			//
-			// But we cannot do both. As this shouldn't occur often, aborting like this is
-			// better than the more complicated alternative (return Unschedulable here, remember
-			// the error, then later raise it again later if needed).
-			return statusError(logger, err, "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
-		}
-		// Check for exact length just to be sure. In practice this is all-or-nothing.
-		if len(allocationResult) != len(claimsToAllocate) {
-			return statusUnschedulable(logger, "cannot allocate all claims", "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
+
+		var allocationResult []resourceapi.AllocationResult
+		if pass1Alloc != nil {
+			if len(pass1Alloc.allocationResults) < len(claimsToAllocate) ||
+				!pl.validateAllocationResults(node, claimsToAllocate, pass1Alloc.allocationResults[:len(claimsToAllocate)], state) {
+				if pl.isPreemptionSupported(pod, state) {
+					return statusUnschedulableResolvable(logger, "cannot allocate all claims", "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
+				}
+				return statusUnschedulable(logger, "cannot allocate all claims", "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
+			}
+			allocationResult = pass1Alloc.allocationResults[:len(claimsToAllocate)]
+		} else {
+			if state.allocatorDirty {
+				features := AllocatorFeatures(pl.fts)
+				allocator, err := structured.NewAllocator(ctx, features, *state.allocatedState, pl.draManager.DeviceClasses(), state.slices, pl.celCache)
+				if err != nil {
+					return statusError(logger, err)
+				}
+				state.allocator = allocator
+				state.allocatorDirty = false
+			}
+			var err error
+			allocationResult, err = state.allocator.Allocate(allocCtx, node, claimsToAllocate)
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				// Timeouts are potentially transient. Return Error
+				// so the pod retries via backoff instead of sitting in the
+				// unschedulable queue waiting for a cluster event.
+				//
+				// The timeout might be caused by ResourceSlices for the node,
+				// so including the node name may help with diagnosing the failure.
+				return statusError(logger, fmt.Errorf("node %s: timed out trying to allocate devices", node.Name), "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
+			case errors.Is(err, structured.ErrFailedAllocationOnNode):
+				// Not a fatal error, allocation on other nodes may proceed.
+				// The error is only surfaced if allocation fails on all nodes.
+				return statusUnschedulable(logger, err.Error(), "pod", klog.KObj(pod), "node", klog.KObj(node))
+			case ctx.Err() != nil:
+				return statusUnschedulable(logger, fmt.Sprintf("asked by caller to stop allocating devices: %v", context.Cause(ctx)), "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
+			case err != nil:
+				// This should only fail if there is something wrong with the claim or class.
+				// Return an error to abort scheduling of it.
+				//
+				// This will cause retries. It would be slightly nicer to mark it as unschedulable
+				// *and* abort scheduling. Then only cluster event for updating the claim or class
+				// with the broken CEL expression would trigger rescheduling.
+				//
+				// But we cannot do both. As this shouldn't occur often, aborting like this is
+				// better than the more complicated alternative (return Unschedulable here, remember
+				// the error, then later raise it again later if needed).
+				return statusError(logger, err, "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
+			}
+			// Check for exact length just to be sure. In practice this is all-or-nothing.
+			if len(allocationResult) != len(claimsToAllocate) {
+				if pl.isPreemptionSupported(pod, state) {
+					return statusUnschedulableResolvable(logger, "cannot allocate all claims", "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
+				}
+				return statusUnschedulable(logger, "cannot allocate all claims", "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaims", klog.KObjSlice(claimsToAllocate))
+			}
 		}
 
 		// Reserve uses this information.
@@ -1094,31 +1214,38 @@ func (pl *DynamicResources) Filter(ctx context.Context, cs fwk.CycleState, pod *
 
 	// Store information in state while holding the mutex.
 	if state.allocator != nil || len(unavailableClaims) > 0 || len(nodeAllocatableClaimStatus) > 0 {
-		state.mutex.Lock()
-		defer state.mutex.Unlock()
+		rootState.mutex.Lock()
+		defer rootState.mutex.Unlock()
 	}
 
 	if len(unavailableClaims) > 0 {
 		// Remember all unavailable claims. This might be observed
 		// concurrently, so we have to lock the state before writing.
 
-		if state.unavailableClaims == nil {
-			state.unavailableClaims = sets.New[int]()
+		if rootState.unavailableClaims == nil {
+			rootState.unavailableClaims = sets.New[int]()
 		}
 
 		for _, index := range unavailableClaims {
-			state.unavailableClaims.Insert(index)
+			rootState.unavailableClaims.Insert(index)
 		}
 
 		return statusUnschedulable(logger, "resourceclaim not available on the node", "pod", klog.KObj(pod))
 	}
 
 	if state.allocator != nil || len(nodeAllocatableClaimStatus) > 0 {
-		state.nodeAllocations[node.Name] = nodeAllocation{
+		alloc := nodeAllocation{
 			allocationResults:                    allocations,
 			extendedResourceClaim:                nodeExtendedResourceClaim,
 			containerResourceRequestMappings:     containerResourceRequestMappings,
 			nodeAllocatableResourceClaimStatuses: nodeAllocatableClaimStatus,
+		}
+		if state.isPass1Clone {
+			if rootState.pass1NodeAllocations != nil {
+				rootState.pass1NodeAllocations[node.Name] = alloc
+			}
+		} else if !state.sawRemovePodSinceClone || state.parent == nil {
+			rootState.nodeAllocations[node.Name] = alloc
 		}
 	}
 
@@ -2060,6 +2187,20 @@ func statusUnschedulable(logger klog.Logger, reason string, kv ...interface{}) *
 		loggerV.Info("pod unschedulable", kv...)
 	}
 	return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, reason)
+}
+
+// statusUnschedulableResolvable is like statusUnschedulable, but returns
+// fwk.Unschedulable so that PostFilter plugins (such as DefaultPreemption)
+// are invoked to try resolving the scheduling failure via preemption.
+func statusUnschedulableResolvable(logger klog.Logger, reason string, kv ...interface{}) *fwk.Status {
+	if loggerV := logger.V(5); loggerV.Enabled() {
+		helper, loggerV := loggerV.WithCallStackHelper()
+		helper()
+		kv = append(kv, "reason", reason)
+		// nolint: logcheck // warns because it cannot check key/values
+		loggerV.Info("pod unschedulable", kv...)
+	}
+	return fwk.NewStatus(fwk.Unschedulable, reason)
 }
 
 // statusError ensures that there is a log message associated with the

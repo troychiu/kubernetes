@@ -364,7 +364,12 @@ func (c *claimTracker) ListAllAllocatedDevices() (a sets.Set[structured.DeviceID
 //
 // Returns errClaimTrackerConcurrentModification if the state changed during collection,
 // indicating the caller should retry.
-func (c *claimTracker) GatherAllocatedState() (s *structured.AllocatedState, err error) {
+func (c *claimTracker) GatherAllocatedState() (*structured.AllocatedState, error) {
+	s, _, err := c.gatherAllocatedStateWithShares()
+	return s, err
+}
+
+func (c *claimTracker) gatherAllocatedStateWithShares() (s *structured.AllocatedState, shareIDs sets.Set[structured.SharedDeviceID], err error) {
 	c.logger.V(6).Info("Starting GatherAllocatedState")
 	defer func() {
 		var a sets.Set[structured.DeviceID]
@@ -380,11 +385,12 @@ func (c *claimTracker) GatherAllocatedState() (s *structured.AllocatedState, err
 
 	allocated, revision1 := c.allocatedDevices.Get()
 	allocatedSharedDeviceIDs, revision2 := c.allocatedDevices.GetSharedDeviceIDs()
-	aggregatedCapacity, revision3 := c.allocatedDevices.Capacities()
+	shareIDs, revision3 := c.allocatedDevices.GetShareIDs()
+	aggregatedCapacity, revision4 := c.allocatedDevices.Capacities()
 
-	if revision1 != revision2 || revision2 != revision3 {
+	if revision1 != revision2 || revision2 != revision3 || revision3 != revision4 {
 		// Already not consistent. Try again.
-		return nil, errClaimTrackerConcurrentModification
+		return nil, nil, errClaimTrackerConcurrentModification
 	}
 
 	if !enabledConsumableCapacity {
@@ -395,8 +401,9 @@ func (c *claimTracker) GatherAllocatedState() (s *structured.AllocatedState, err
 		for deviceID := range allocatedSharedDeviceIDs {
 			allocated.Insert(deviceID)
 		}
-		// Reset allocatedSharedDeviceIDs and aggregatedCapacity
+		// Reset allocatedSharedDeviceIDs, shareIDs, and aggregatedCapacity
 		allocatedSharedDeviceIDs = sets.New[structured.DeviceID]()
+		shareIDs = sets.New[structured.SharedDeviceID]()
 		aggregatedCapacity = make(schedulerapi.ConsumedCapacityCollection)
 	}
 
@@ -412,6 +419,7 @@ func (c *claimTracker) GatherAllocatedState() (s *structured.AllocatedState, err
 			func(sharedDeviceID structured.SharedDeviceID) { // sharedDeviceCallback
 				c.logger.V(6).Info("Device is in flight for allocation", "shared device", sharedDeviceID, "claim", klog.KObj(claim))
 				allocatedSharedDeviceIDs.Insert(sharedDeviceID.GetDeviceID())
+				shareIDs.Insert(sharedDeviceID)
 			},
 			func(capacity structured.DeviceConsumedCapacity) { // consumedCapacityCallback
 				c.logger.V(6).Info("Device is in flight for allocation", "consumed capacity", capacity, "claim", klog.KObj(claim))
@@ -424,10 +432,10 @@ func (c *claimTracker) GatherAllocatedState() (s *structured.AllocatedState, err
 			AllocatedDevices:         allocated,
 			AllocatedSharedDeviceIDs: allocatedSharedDeviceIDs,
 			AggregatedCapacity:       aggregatedCapacity,
-		}, nil
+		}, shareIDs, nil
 	}
 
-	return nil, errClaimTrackerConcurrentModification
+	return nil, nil, errClaimTrackerConcurrentModification
 }
 
 func (c *claimTracker) allInFlightAllocationsRLocked() iter.Seq2[types.UID, inFlightAllocation] {

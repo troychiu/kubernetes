@@ -6395,3 +6395,426 @@ func TestPreQueueingHint_SharedClaimMultiplePods(t *testing.T) {
 		t.Errorf("expected 3 pods, got %d: %v", len(got.Pods), got.Pods)
 	}
 }
+
+func TestPreFilterExtensions(t *testing.T) {
+	tCtx := ktesting.Init(t)
+
+	victimPodName := "victim-pod"
+	victimPodUID := types.UID("victim-uid")
+	victimClaimName := "victim-claim"
+	victimPod := st.MakePod().Name(victimPodName).Namespace(namespace).
+		UID(string(victimPodUID)).
+		Node(nodeName).
+		PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimName: &victimClaimName}).
+		Obj()
+
+	victim2PodName := "victim-pod-2"
+	victim2PodUID := types.UID("victim-uid-2")
+	victim2ClaimName := "victim-claim-2"
+	victim2Pod := st.MakePod().Name(victim2PodName).Namespace(namespace).
+		UID(string(victim2PodUID)).
+		Node(nodeName).
+		PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimName: &victim2ClaimName}).
+		Obj()
+
+	victimClaim := st.FromResourceClaim(claim).
+		Name(victimClaimName).
+		OwnerReference(victimPodName, string(victimPodUID), podKind).
+		Allocation(allocationResult).
+		ReservedForPod(victimPodName, victimPodUID).
+		Obj()
+
+	baseFeats := func(enablePreemption bool) feature.Features {
+		return feature.Features{
+			EnableDRAPreemption:                enablePreemption,
+			EnableDRASchedulerFilterTimeout:    true,
+			EnableDRADeviceBindingConditions:   true,
+			EnableDRAResourceClaimDeviceStatus: true,
+		}
+	}
+
+	tCtx.Run("feature-gate-disabled", func(tCtx ktesting.TContext) {
+		feats := baseFeats(false)
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingClaim, victimClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{workerNodeSlice, victimPod}, feats, false, nil)
+		require.Nil(tCtx, testCtx.p.PreFilterExtensions())
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		status = testCtx.p.Filter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.UnschedulableAndUnresolvable, status.Code())
+	})
+
+	tCtx.Run("dedicated-device-remove-and-add-pod", func(tCtx ktesting.TContext) {
+		feats := baseFeats(true)
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingClaim, victimClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{workerNodeSlice, victimPod}, feats, false, nil)
+		require.NotNil(tCtx, testCtx.p.PreFilterExtensions())
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victimPod)
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		// Without removing the victim, Filter returns Unschedulable (resolvable via preemption).
+		status = testCtx.p.Filter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+
+		// Clone state and remove victim pod.
+		clonedState := testCtx.state.Clone()
+		victimPodInfo, err := framework.NewPodInfo(victimPod)
+		require.NoError(tCtx, err)
+		status = testCtx.p.RemovePod(tCtx, clonedState, podWithClaimName, victimPodInfo, testCtx.nodeInfos[0])
+		require.True(tCtx, status.IsSuccess())
+
+		// Filter succeeds on cloned state after victim removal.
+		status = testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0])
+		require.True(tCtx, status.IsSuccess())
+
+		// Original state remains unaffected by cloned state's RemovePod.
+		status = testCtx.p.Filter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+
+		// Reprieving the victim via AddPod restores its allocation and causes Filter to fail again.
+		status = testCtx.p.AddPod(tCtx, clonedState, podWithClaimName, victimPodInfo, testCtx.nodeInfos[0])
+		require.True(tCtx, status.IsSuccess())
+		status = testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+	})
+
+	tCtx.Run("per-device-node-selection", func(tCtx ktesting.TContext) {
+		featuregatetesting.SetFeatureGateDuringTest(tCtx, utilfeature.DefaultFeatureGate, features.DRAPartitionableDevices, true)
+		feats := baseFeats(true)
+		feats.EnableDRAPartitionableDevices = true
+		perDeviceSlice := &resourceapi.ResourceSlice{
+			ObjectMeta: metav1.ObjectMeta{Name: "per-device-slice"},
+			Spec: resourceapi.ResourceSliceSpec{
+				Driver:                 driver,
+				Pool:                   resourceapi.ResourcePool{Name: nodeName, ResourceSliceCount: 1},
+				PerDeviceNodeSelection: ptr.To(true),
+				Devices: []resourceapi.Device{
+					{
+						Name:     "instance-1",
+						NodeName: &nodeName,
+					},
+				},
+			},
+		}
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingClaim, victimClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{perDeviceSlice, victimPod}, feats, false, nil)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victimPod)
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+		status = testCtx.p.Filter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+
+		clonedState := testCtx.state.Clone()
+		victimPodInfo, err := framework.NewPodInfo(victimPod)
+		require.NoError(tCtx, err)
+		require.True(tCtx, testCtx.p.RemovePod(tCtx, clonedState, podWithClaimName, victimPodInfo, testCtx.nodeInfos[0]).IsSuccess())
+		require.True(tCtx, testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0]).IsSuccess())
+	})
+
+	tCtx.Run("consumable-capacity-remove-and-add-pod", func(tCtx ktesting.TContext) {
+		featuregatetesting.SetFeatureGateDuringTest(tCtx, utilfeature.DefaultFeatureGate, features.DRAConsumableCapacity, true)
+		feats := baseFeats(true)
+		feats.EnableDRAConsumableCapacity = true
+		sharedSlice := &resourceapi.ResourceSlice{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+			Spec: resourceapi.ResourceSliceSpec{
+				Driver:   driver,
+				NodeName: &nodeName,
+				Pool:     resourceapi.ResourcePool{Name: nodeName, ResourceSliceCount: 1},
+				Devices: []resourceapi.Device{
+					{
+						Name:                     sharedDeviceName,
+						AllowMultipleAllocations: ptr.To(true),
+						Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
+							capacityName: {
+								Value: apiresource.MustParse("2"),
+								RequestPolicy: &resourceapi.CapacityRequestPolicy{
+									Default: ptr.To(apiresource.MustParse("1")),
+									ValidRange: &resourceapi.CapacityRequestPolicyRange{
+										Min: ptr.To(apiresource.MustParse("1")),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		vClaim1 := st.FromResourceClaim(claim).
+			Name(victimClaimName).
+			OwnerReference(victimPodName, string(victimPodUID), podKind).
+			Allocation(allocationResultWithConsumedCapacity).
+			ReservedForPod(victimPodName, victimPodUID).
+			Obj()
+		vClaim2 := st.FromResourceClaim(claim).
+			Name(victim2ClaimName).
+			OwnerReference(victim2PodName, string(victim2PodUID), podKind).
+			Allocation(allocationResultWithConsumedCapacity2).
+			ReservedForPod(victim2PodName, victim2PodUID).
+			Obj()
+		preemptorClaim := st.FromResourceClaim(pendingClaim).Obj()
+		preemptorClaim.Spec.Devices.Requests[0].Exactly.Capacity = &resourceapi.CapacityRequirements{
+			Requests: map[resourceapi.QualifiedName]apiresource.Quantity{
+				capacityName: apiresource.MustParse("1"),
+			},
+		}
+
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{preemptorClaim, vClaim1, vClaim2}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{sharedSlice, victimPod, victim2Pod}, feats, false, nil)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victimPod)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victim2Pod)
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		// Capacity 2 is fully consumed by victim1 (1) + victim2 (1).
+		status = testCtx.p.Filter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+
+		// Removing victim1 frees 1 unit of capacity while victim2 still holds a share.
+		clonedState := testCtx.state.Clone()
+		v1Info, err := framework.NewPodInfo(victimPod)
+		require.NoError(tCtx, err)
+		require.True(tCtx, testCtx.p.RemovePod(tCtx, clonedState, podWithClaimName, v1Info, testCtx.nodeInfos[0]).IsSuccess())
+
+		sData, err := getStateData(clonedState)
+		require.NoError(tCtx, err)
+		devID := structured.MakeDeviceID(driver, nodeName, sharedDeviceName)
+		// Device is still in AllocatedSharedDeviceIDs because victim2's share remains.
+		assert.True(tCtx, sData.allocatedState.AllocatedSharedDeviceIDs.Has(devID))
+
+		// Preemptor requesting 1 unit of capacity now fits!
+		require.True(tCtx, testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0]).IsSuccess())
+
+		// Removing victim2 as well removes the device from AllocatedSharedDeviceIDs completely.
+		v2Info, err := framework.NewPodInfo(victim2Pod)
+		require.NoError(tCtx, err)
+		require.True(tCtx, testCtx.p.RemovePod(tCtx, clonedState, podWithClaimName, v2Info, testCtx.nodeInfos[0]).IsSuccess())
+		assert.False(tCtx, sData.allocatedState.AllocatedSharedDeviceIDs.Has(devID))
+
+		// Reprieving both victims makes Filter fail again.
+		require.True(tCtx, testCtx.p.AddPod(tCtx, clonedState, podWithClaimName, v1Info, testCtx.nodeInfos[0]).IsSuccess())
+		require.True(tCtx, testCtx.p.AddPod(tCtx, clonedState, podWithClaimName, v2Info, testCtx.nodeInfos[0]).IsSuccess())
+		status = testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+	})
+
+	tCtx.Run("partitionable-devices-remove-and-add-pod", func(tCtx ktesting.TContext) {
+		featuregatetesting.SetFeatureGateDuringTest(tCtx, utilfeature.DefaultFeatureGate, features.DRAPartitionableDevices, true)
+		feats := baseFeats(true)
+		feats.EnableDRAPartitionableDevices = true
+		counterSetSlice := &resourceapi.ResourceSlice{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-counters"},
+			Spec: resourceapi.ResourceSliceSpec{
+				Driver:   driver,
+				NodeName: &nodeName,
+				Pool:     resourceapi.ResourcePool{Name: nodeName, ResourceSliceCount: 2},
+				SharedCounters: []resourceapi.CounterSet{
+					{
+						Name: "counter-set-1",
+						Counters: map[string]resourceapi.Counter{
+							"memory": {Value: apiresource.MustParse("8Gi")},
+						},
+					},
+				},
+			},
+		}
+		partitionableDevicesSlice := &resourceapi.ResourceSlice{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-devices"},
+			Spec: resourceapi.ResourceSliceSpec{
+				Driver:   driver,
+				NodeName: &nodeName,
+				Pool:     resourceapi.ResourcePool{Name: nodeName, ResourceSliceCount: 2},
+				Devices: []resourceapi.Device{
+					{
+						Name: "instance-1",
+						ConsumesCounters: []resourceapi.DeviceCounterConsumption{
+							{
+								CounterSet: "counter-set-1",
+								Counters: map[string]resourceapi.Counter{
+									"memory": {Value: apiresource.MustParse("8Gi")},
+								},
+							},
+						},
+					},
+					{
+						Name: "instance-2",
+						ConsumesCounters: []resourceapi.DeviceCounterConsumption{
+							{
+								CounterSet: "counter-set-1",
+								Counters: map[string]resourceapi.Counter{
+									"memory": {Value: apiresource.MustParse("8Gi")},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingClaim, victimClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{counterSetSlice, partitionableDevicesSlice, victimPod}, feats, false, nil)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victimPod)
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		// instance-2 is unallocated, but counter-set-1 is exhausted by instance-1 (allocated to victimPod).
+		status = testCtx.p.Filter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+
+		clonedState := testCtx.state.Clone()
+		victimPodInfo, err := framework.NewPodInfo(victimPod)
+		require.NoError(tCtx, err)
+		require.True(tCtx, testCtx.p.RemovePod(tCtx, clonedState, podWithClaimName, victimPodInfo, testCtx.nodeInfos[0]).IsSuccess())
+		require.True(tCtx, testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0]).IsSuccess())
+
+		require.True(tCtx, testCtx.p.AddPod(tCtx, clonedState, podWithClaimName, victimPodInfo, testCtx.nodeInfos[0]).IsSuccess())
+		status = testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+	})
+
+	tCtx.Run("in-flight-claim-in-prebind", func(tCtx ktesting.TContext) {
+		feats := baseFeats(true)
+		inFlightVictimClaim := st.FromResourceClaim(claim).
+			Name(victimClaimName).
+			OwnerReference(victimPodName, string(victimPodUID), podKind).
+			Obj()
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingClaim, inFlightVictimClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{workerNodeSlice, victimPod}, feats, false, nil)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victimPod)
+
+		cachedClaim, err := testCtx.draManager.ResourceClaims().Get(namespace, victimClaimName)
+		require.NoError(tCtx, err)
+		allocatedInFlight := cachedClaim.DeepCopy()
+		allocatedInFlight.Status.Allocation = allocationResult
+		require.NoError(tCtx, testCtx.draManager.ResourceClaims().SignalClaimPendingAllocation(cachedClaim.UID, allocatedInFlight))
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		// In-flight allocation blocks Filter.
+		status = testCtx.p.Filter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+
+		// RemovePod releases the victim's in-flight allocation.
+		clonedState := testCtx.state.Clone()
+		victimPodInfo, err := framework.NewPodInfo(victimPod)
+		require.NoError(tCtx, err)
+		require.True(tCtx, testCtx.p.RemovePod(tCtx, clonedState, podWithClaimName, victimPodInfo, testCtx.nodeInfos[0]).IsSuccess())
+		require.True(tCtx, testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0]).IsSuccess())
+	})
+
+	tCtx.Run("shared-claim-between-multiple-pods", func(tCtx ktesting.TContext) {
+		feats := baseFeats(true)
+		sharedVictimClaim := st.FromResourceClaim(claim).
+			Name(victimClaimName).
+			Allocation(allocationResult).
+			ReservedFor(
+				resourceapi.ResourceClaimConsumerReference{Resource: "pods", Name: victimPodName, UID: victimPodUID},
+				resourceapi.ResourceClaimConsumerReference{Resource: "pods", Name: victim2PodName, UID: victim2PodUID},
+			).
+			Obj()
+		victim2SharingPod := victim2Pod.DeepCopy()
+		victim2SharingPod.Spec.ResourceClaims = []v1.PodResourceClaim{
+			{Name: resourceName, ResourceClaimName: &victimClaimName},
+		}
+
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingClaim, sharedVictimClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{workerNodeSlice, victimPod, victim2SharingPod}, feats, false, nil)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victimPod)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victim2SharingPod)
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		clonedState := testCtx.state.Clone()
+		v1Info, err := framework.NewPodInfo(victimPod)
+		require.NoError(tCtx, err)
+		v2Info, err := framework.NewPodInfo(victim2SharingPod)
+		require.NoError(tCtx, err)
+
+		// Removing only victim1 does not free the shared claim.
+		require.True(tCtx, testCtx.p.RemovePod(tCtx, clonedState, podWithClaimName, v1Info, testCtx.nodeInfos[0]).IsSuccess())
+		status = testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+
+		// Removing victim2 as well frees the shared claim.
+		require.True(tCtx, testCtx.p.RemovePod(tCtx, clonedState, podWithClaimName, v2Info, testCtx.nodeInfos[0]).IsSuccess())
+		require.True(tCtx, testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0]).IsSuccess())
+
+		// Adding back victim1 re-allocates the shared claim in the simulation.
+		require.True(tCtx, testCtx.p.AddPod(tCtx, clonedState, podWithClaimName, v1Info, testCtx.nodeInfos[0]).IsSuccess())
+		status = testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+	})
+
+	tCtx.Run("non-node-local-slices-ignored", func(tCtx ktesting.TContext) {
+		feats := baseFeats(true)
+		allNodesSlice := &resourceapi.ResourceSlice{
+			ObjectMeta: metav1.ObjectMeta{Name: "all-nodes-slice"},
+			Spec: resourceapi.ResourceSliceSpec{
+				Driver:   driver,
+				AllNodes: ptr.To(true),
+				Pool:     resourceapi.ResourcePool{Name: nodeName, ResourceSliceCount: 1},
+				Devices: []resourceapi.Device{
+					{Name: "instance-1"},
+				},
+			},
+		}
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingClaim, victimClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{allNodesSlice, victimPod}, feats, false, nil)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victimPod)
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		clonedState := testCtx.state.Clone()
+		victimPodInfo, err := framework.NewPodInfo(victimPod)
+		require.NoError(tCtx, err)
+		require.True(tCtx, testCtx.p.RemovePod(tCtx, clonedState, podWithClaimName, victimPodInfo, testCtx.nodeInfos[0]).IsSuccess())
+
+		// Device from an AllNodes slice is not released by node-local preemption simulation.
+		status = testCtx.p.Filter(tCtx, clonedState, podWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.Unschedulable, status.Code())
+	})
+
+	tCtx.Run("podgroup-excluded-from-preemption", func(tCtx ktesting.TContext) {
+		featuregatetesting.SetFeatureGatesDuringTest(tCtx, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			features.GenericWorkload:           true,
+			features.DRAWorkloadResourceClaims: true,
+		})
+		feats := baseFeats(true)
+		feats.EnableDRAWorkloadResourceClaims = true
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingPodGroupClaim, victimClaim}, []*resourceapi.DeviceClass{deviceClass}, []*schedulingapi.PodGroup{podGroupWithClaimName}, []apiruntime.Object{workerNodeSlice, victimPod, groupedPodWithClaimName}, feats, false, nil)
+		testCtx.nodeInfos[0].(*framework.NodeInfo).AddPod(victimPod)
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, groupedPodWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		// PodGroup pods return UnschedulableAndUnresolvable so DefaultPreemption is skipped.
+		status = testCtx.p.Filter(tCtx, testCtx.state, groupedPodWithClaimName, testCtx.nodeInfos[0])
+		require.Equal(tCtx, fwk.UnschedulableAndUnresolvable, status.Code())
+	})
+
+	tCtx.Run("pass1-pass2-validation", func(tCtx ktesting.TContext) {
+		feats := baseFeats(true)
+		testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{workerNodeSlice}, feats, false, nil)
+
+		_, status := testCtx.p.PreFilter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos)
+		require.True(tCtx, status.IsSuccess())
+
+		// Simulate Pass 1 of RunFilterPluginsWithNominatedPods: clone state, call AddPod without RemovePod, then Filter.
+		pass1State := testCtx.state.Clone()
+		nomPodInfo, err := framework.NewPodInfo(st.MakePod().Name("nominated").Namespace(namespace).UID("nom-uid").Obj())
+		require.NoError(tCtx, err)
+		require.True(tCtx, testCtx.p.AddPod(tCtx, pass1State, podWithClaimName, nomPodInfo, testCtx.nodeInfos[0]).IsSuccess())
+		require.True(tCtx, testCtx.p.Filter(tCtx, pass1State, podWithClaimName, testCtx.nodeInfos[0]).IsSuccess())
+
+		rootData, err := getStateData(testCtx.state)
+		require.NoError(tCtx, err)
+		assert.Contains(tCtx, rootData.pass1NodeAllocations, nodeName)
+		assert.NotContains(tCtx, rootData.nodeAllocations, nodeName)
+
+		// Pass 2 on root state validates Pass 1's allocationResult and commits it to nodeAllocations.
+		require.True(tCtx, testCtx.p.Filter(tCtx, testCtx.state, podWithClaimName, testCtx.nodeInfos[0]).IsSuccess())
+		assert.NotContains(tCtx, rootData.pass1NodeAllocations, nodeName)
+		assert.Contains(tCtx, rootData.nodeAllocations, nodeName)
+	})
+}
